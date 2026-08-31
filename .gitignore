@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Captured game frames: large, machine-specific, not source
+captures/
+
+# Template assets are intentionally tracked, but keep scratch crops out
+assets/templates/_scratch/
+
+# YOLO artifacts
+*.pt
+runs/
+datasets/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local logs
+*.log
+
+# Calibration output: regenerable from captures/ via tools/calibrate.py
+reports/
+
+# Output of tests/manual/test_eyes.py: a frame of this machine's game window
+tests/manual/*.png
+
+# pytest report artifacts, regenerable via tools/run_suite.py
+junit*.xml
+
+# Local-only notes and planning documents. The steering documents that do ship
+# with the repo are the technical ones (calibration, minigame_memory, workflow);
+# the three below stay local. Git history cannot be scrubbed after the fact,
+# so they must never be committed even once.
+.kiro/steering/private.md
+.kiro/steering/project.md
+.kiro/steering/roadmap.md

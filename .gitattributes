@@ -1,0 +1,10 @@
+# Normalise line endings in the repository to LF, while letting Windows check
+# files out as CRLF. Added before the first commit on purpose: introducing this
+# later rewrites every text blob at once, which shows up as the whole repository
+# having been modified.
+* text=auto eol=lf
+
+# Be explicit about the assets so nothing tries to translate their bytes.
+*.png binary
+*.jpg binary
+*.pt binary
