@@ -11,10 +11,11 @@ real incidents motivated these tests.
   b"\\x81\\x30\\x85\\x35". Because the fallback list only tried gbk, the file
   decoded as neither UTF-8 nor gbk and looked irrecoverably corrupt when it was
   in fact losslessly recoverable.
-* ``.kiro`` sat in ``SKIP_DIRS``, and since that test matches any path *part*,
-  the entire tree was excluded -- including ``.kiro/steering/*.md``, the files
+* The legacy agent directory sat in ``SKIP_DIRS``, and since that test matches any path *part*,
+  the entire tree was excluded -- including the rules documents (now under
+  ``.agents/rules/``), the files
   most likely to be mis-encoded. The exclusion was invisible: scanning with
-  ``--root .kiro`` printed nothing at all, which reads like "clean".
+  ``--root .agents`` printed nothing at all, which reads like "clean".
 * A partial edit left one region of a file in UTF-8 and the rest in the ANSI
   code page. Such a file can still decode cleanly under gb18030, so the tool
   would "repair" it and mojibake every character that had been correct.
@@ -133,7 +134,7 @@ def make_mixed(head_utf8: str, tail_legacy: str) -> bytes:
     return head_utf8.encode("utf-8") + tail_legacy.encode("gb18030")
 
 
-#: CJK-dense document, the shape of the steering notes.
+#: CJK-dense document, the shape of the rules notes.
 DENSE_HEAD = "面积判定按路径分量做\n"
 DENSE_TAIL = "替换后内容：匹配后留在盘面，机会数恒为一点五倍对数。\n"
 
@@ -220,29 +221,24 @@ def test_pure_ascii_is_never_called_mixed(tool):
 # --- which trees get scanned --------------------------------------------------
 
 
-def test_steering_documents_are_scanned(tool, tmp_path):
-    """.kiro/steering must be visited; .kiro/hooks and settings must not."""
-    steering = tmp_path / ".kiro" / "steering"
-    hooks = tmp_path / ".kiro" / "hooks"
-    settings = tmp_path / ".kiro" / "settings"
-    for directory in (steering, hooks, settings):
-        directory.mkdir(parents=True)
+def test_rules_documents_are_scanned(tool, tmp_path):
+    """.agents/rules must be visited; .agents/hooks.json must not."""
+    rules = tmp_path / ".agents" / "rules"
+    rules.mkdir(parents=True)
 
-    (steering / "roadmap.md").write_text("x", encoding="utf-8")
-    (hooks / "ensure-utf8.json").write_text("{}", encoding="utf-8")
-    (settings / "mcp.json").write_text("{}", encoding="utf-8")
+    (rules / "roadmap.md").write_text("x", encoding="utf-8")
+    (tmp_path / ".agents" / "hooks.json").write_text("{}", encoding="utf-8")
 
     found = {
         path.relative_to(tmp_path).as_posix() for path in tool.iter_candidates(tmp_path)
     }
 
-    assert ".kiro/steering/roadmap.md" in found
-    assert ".kiro/hooks/ensure-utf8.json" not in found
-    assert ".kiro/settings/mcp.json" not in found
+    assert ".agents/rules/roadmap.md" in found
+    assert ".agents/hooks.json" not in found
 
 
 def test_generated_and_vendored_trees_are_still_skipped(tool, tmp_path):
-    """The original exclusions must survive the .kiro change."""
+    """The original exclusions must survive the .agents change."""
     for part in ("__pycache__", ".git", "assets", "node_modules"):
         directory = tmp_path / part
         directory.mkdir()

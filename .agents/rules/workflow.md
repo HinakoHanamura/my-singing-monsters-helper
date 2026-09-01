@@ -60,16 +60,22 @@
 **两条已确认的事实在这里对撞：**
 
 - 含中文的文件做局部文本编辑 → 编码被重写，可能产出混合编码（1a）
-- 于是整体重写是唯一安全的编辑方式 → **但它在 25KB 的 steering 文档上会失败**，
+- 于是整体重写是唯一安全的编辑方式 → **但它在 25KB 的 rules 规则文档上会失败**，
   连续五次 `The connection was interrupted`
 
-结果是「给大段中文文档做小改」没有任何安全路径，而保持 steering 文档新鲜正好需要它。
+结果是「给大段中文文档做小改」没有任何安全路径，而保持 rules 规则文档新鲜正好需要它。
+
+**`The connection was interrupted` 有第二种成因，不要一律当成「文件太大」。**
+里程碑 3 里 `fs_write` 报了一模一样的这句话，而目标是个**还不存在的小文件**——
+真正的原因是**调用漏掉了内容参数**。当时差一步就去把文件拆小了，
+而要拆的那个文件只有几 KB，拆它解决不了任何问题。
+**先检查参数齐不齐，再怀疑体积。** 这个错误信息不区分二者。
 
 `tools/apply_doc_edits.py` 就是那条路径。它把改写放进一个**纯 ASCII** 的脚本里，
 中文只存在于它读的数据文件中，编码写死成 UTF-8：
 
 ```powershell
-python tools/apply_doc_edits.py .kiro/steering/workflow.md reports/_edit1.md
+python tools/apply_doc_edits.py .agents/rules/workflow.md reports/_edit1.md
 ```
 
 数据文件用三行标记分隔（三个左尖括号 + `OLD` / `NEW` / `END`，**只在行首生效**），
@@ -150,8 +156,8 @@ target.write_bytes(data.replace(old, new))
 
 ### 1g. 不要依赖钩子，手动跑
 
-`.kiro/hooks/ensure-utf8.json` 是 `PostToolUse` 钩子，匹配
-`fs_write|str_replace|fs_append` 后跑 `ensure_utf8.py`。**它并不总是触发**——
+`.agents/hooks.json` 是 `PostToolUse` 钩子，匹配
+`write_to_file|replace_file_content|multi_replace_file_content` 后跑 `ensure_utf8.py`。**它并不总是触发**——
 实测有写完文件后钩子没跑、文件保持 GB18030 直到手动执行才被修的情况。
 
 **规则：写完含中文的文件，自己验一遍。**
@@ -173,9 +179,9 @@ python -c "import pathlib;pathlib.Path('<文件>').read_bytes().decode('utf-8');
 
 `ensure_utf8.py` 现在的覆盖范围与回退顺序：
 
-- 扫 `.kiro/steering`（以前 `.kiro` 整棵树被 `SKIP_DIRS` 跳过，
-  判定是**按路径分量**做的，所以连 `--root .kiro` 也静默返回空——别把那当成「干净」）
-- 仍跳过 `.kiro/hooks`、`.kiro/settings`、`__pycache__`、`.git`、`assets`、`node_modules`
+- 扫 `.agents/rules`（以前旧配置整棵树曾被 `SKIP_DIRS` 跳过，
+  判定是**按路径分量**做的，所以连 `--root .agents` 也静默返回空——别把那当成「干净」）
+- 仍跳过 `.agents/hooks.json`、`__pycache__`、`.git`、`assets`、`node_modules`
 - 回退顺序 `gbk → cp936 → gb18030 → big5`。gbk 排在 gb18030 前面是因为它更严格，
   先试它能让报告出的编码名更具体
 - UTF-16 **只认 BOM**，绝不试解码。试解码会把中文 ANSI 误判成 UTF-16 然后毁掉文件，
@@ -187,7 +193,7 @@ python -c "import pathlib;pathlib.Path('<文件>').read_bytes().decode('utf-8');
 
 ### 1h. 验证内容时的三个假信号
 
-- **`grep_search` 默认跳过点开头的目录。** 对 `.kiro/steering/*.md` 检索会返回
+- **`grep_search` 默认跳过点开头的目录。** 对 `.agents/rules/*.md` 检索会返回
   「无匹配」，即使内容确实存在。**别当成文件损坏的证据。**
 - **`grep_search` 的输出会把中文显示成乱码。** 曾据此误以为
   `core/validators.py` 的 `label = "下方无怪物特征"` 被破坏，实际文件完全正常。
@@ -197,9 +203,9 @@ python -c "import pathlib;pathlib.Path('<文件>').read_bytes().decode('utf-8');
 
 ### 1i. VS Code 可能用错编码打开，而保存就会毁掉文件
 
-**实测**：VS Code 打开 steering 文档时，需要手动切到 UTF-8 才能正常显示中文。
+**实测**：VS Code 打开 rules 规则文档时，需要手动切到 UTF-8 才能正常显示中文。
 
-**已核对：文件本身没问题。** 所有 steering 文档都是干净的 UTF-8，严格解码通过。
+**已核对：文件本身没问题。** 所有 rules 规则文档都是干净的 UTF-8，严格解码通过。
 
 仓库里也**没有** `.vscode/settings.json`。所以**是编辑器的读取设置不对，不是文件坏了**。
 
@@ -440,18 +446,21 @@ OpenCV 返回的值不是测量结果。写决策循环的测试时用了纯色�
 
 ## 测试规程
 
-- 全量应为 **472 项通过**，约 80 秒。构成：
+- 全量应为 **472 项通过**，约 80~95 秒。构成是用 `pytest --collect-only`
+  逐文件数出来的；**上一版这张表的分项加起来是 469，比总数少 3**，
+  「决策循环」与「卡面聚类」两行都偏小。**一张算不平的构成表比没有表更糟**，
+  它会让人以为某一类测试比实际少。
 
 ```
-既有（窗口/几何/视觉/校验/引擎/UI）  251
+既有（窗口/几何/视觉/校验/引擎/UI）  251   （11 个文件，正好 251）
 minigame 决策层（求解器 66 + 阅读顺序 18） 84
-卡背检测与槽位追踪（25 + 14 + 3）    42
-决策循环                             46
-卡面聚类                             34
+卡背检测与槽位追踪（25 + 17）        42
+决策循环                             48
+卡面聚类                             35
 编码工具                             12
 ```
 
-  历史基线：搬到 E 盘后 322，加编码测试 334，加感知层 371，加决策循环 392，
+  历史基线：迁移工作目录后 322，加编码测试 334，加感知层 371，加决策循环 392，
   加聚类 421，卡背补测 424，加速度优化与策略开关 448，加翻牌阶段优化 453，
   加关卡切换竞态 455，加机会数预算与杂框区分 462，加分组合并与失配黑名单 468，
   加卡背比对与读取推后 **472**。
@@ -469,7 +478,12 @@ minigame 决策层（求解器 66 + 阅读顺序 18） 84
   或中文 summary 做子串匹配。它们让那 4 个文件继续留在编码陷阱内。
   没有顺手改，因为**不是每处都有 ASCII `code` 可断言**：`Verdict` / `GuardBlock`
   有 `code`，而 `bot_engine` 的日志行只是中文字符串，要断言 ASCII 就得先给日志
-  加稳定标识——那是设计改动。清单与取舍记在 `roadmap.md` 的待办清单里。
+  加稳定标识——那是设计改动。**分布**：`test_ui_engine_lifecycle.py` 9 处、
+  `test_engine_decision_pipeline.py` 8 处、`test_minigame_memory_solver.py` 3 处、
+  `test_minigame_grid_reading_order.py` 3 处。
+  另有 3 处是 `assert ... , "中文失败消息"`，那是另一类——失败消息面向开发者、
+  不是断言目标，规则没禁止。
+  `test_ensure_utf8_encoding_recovery.py` 的 13 处中文是**编码样本数据**，必须保留。
 - UI 集成测试会**真的起工作线程**，所以固定用一个不存在的窗口标题，
   让它们只能走"找不到窗口"那条分支。别把那个标题改成真的。
 

@@ -8,7 +8,7 @@ name, e-mail addresses and anything decoded as a fallback encoding.
 Why it exists: git history cannot be scrubbed after the fact, so a personal
 detail committed once is committed forever. Reviewing by eye does not scale and
 had already missed things: the first run over 69 files found the Windows account
-name in two steering documents, in passages nobody would have thought to check.
+name in two rules documents, in passages nobody would have thought to check.
 Both were paths written down as examples years of edits ago.
 
 This file is deliberately pure ASCII, so the tool itself cannot be mangled by
@@ -44,9 +44,9 @@ SKIP_DIRS = {
 # findings pass condition unusable: a note written for local reference gets
 # reported as if it were about to be published.
 SKIP_FILES = {
-    ".kiro/steering/private.md",
-    ".kiro/steering/project.md",
-    ".kiro/steering/roadmap.md",
+    ".agents/rules/private.md",
+    ".agents/rules/project.md",
+    ".agents/rules/roadmap.md",
 }
 SKIP_SUFFIX = {".png", ".jpg", ".pt", ".pyc", ".log"}
 SKIP_GLOB = ("junit",)

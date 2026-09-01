@@ -25,7 +25,7 @@ Usage
     python tools/ensure_utf8.py           # fix files in place
     python tools/ensure_utf8.py --check   # report only, non-zero exit if dirty
 
-Wired into .kiro/hooks/ensure-utf8.json so it runs automatically after any
+Wired into .agents/hooks.json so it runs automatically after any
 agent file write.
 """
 
@@ -48,17 +48,16 @@ SKIP_DIRS = {
     "assets",
 }
 
-# Sub-trees under .kiro that must not be touched, as path prefixes relative to
+# Sub-trees under .agents that must not be touched, as path prefixes relative to
 # the project root.
 #
-# .kiro used to sit in SKIP_DIRS, which excluded the whole tree because the test
-# matches any path *part*. That silently left .kiro/steering/*.md unprotected --
+# The legacy agent directory used to sit in SKIP_DIRS, which excluded the whole tree because the test
+# matches any path *part*. That silently left .agents/rules/*.md unprotected --
 # and those files are full of CJK, so they are exactly the ones that get written
 # as GB18030. Only the machine-readable configuration needs shielding, so skip
 # that and scan the documentation.
 SKIP_PREFIXES = (
-    (".kiro", "hooks"),
-    (".kiro", "settings"),
+    (".agents", "hooks.json"),
 )
 
 # Fallback encodings tried in order when UTF-8 fails.

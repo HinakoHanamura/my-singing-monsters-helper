@@ -1,5 +1,7 @@
 # tests/manual — 需要真实游戏的手动脚本
 
+[English](README.en.md) | **简体中文**
+
 这里的脚本**不是自动化测试**，pytest 不会收集它们（见 `pytest.ini` 的
 `--ignore=tests/manual`）。它们需要《My Singing Monsters》正在运行，会真的截图、
 可能真的点击，因此只能由人手动执行、手动看结果。

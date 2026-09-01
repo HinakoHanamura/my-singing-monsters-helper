@@ -3,16 +3,16 @@
 Why this tool exists
 --------------------
 Two facts about this environment collide (both documented in
-``.kiro/steering/workflow.md``):
+``.agents/rules/workflow.md``):
 
 * A partial text edit on a file containing Chinese rewrites the whole file in an
   unpredictable encoding, and has repeatedly produced genuinely mixed-encoding
   files that no single codec can recover.
 * Rewriting a whole file is therefore the only safe edit -- but on the 25KB
-  steering documents that write has failed outright, repeatedly.
+  rules documents that write has failed outright, repeatedly.
 
 That leaves no safe way to make a small change to a large Chinese document, which
-is exactly what keeping the steering docs current requires. So the rewrite happens
+is exactly what keeping the rules docs current requires. So the rewrite happens
 here, where the encoding is stated explicitly instead of guessed.
 
 **This file is deliberately pure ASCII.** The Chinese lives in the data files it
@@ -58,7 +58,7 @@ FALLBACKS = ("utf-8", "gb18030", "gbk")
 
 # Markers are recognised only at the start of a line, so an edits file can quote
 # the format in an indented example without the parser eating it. That is not a
-# hypothetical: documenting this tool inside a steering doc broke the first
+# hypothetical: documenting this tool inside a rules doc broke the first
 # attempt, and the "exactly once" guard is what caught it.
 OLD_MARKER = "\n<<<OLD\n"
 NEW_MARKER = "\n<<<NEW\n"
