@@ -280,6 +280,20 @@ class GameWindow:
             )
         return cropped
 
+    def park_physical_cursor(self) -> None:
+        """If physical mouse cursor is hovering inside the game client area, park it safely."""
+        if not self._hwnd:
+            return
+        try:
+            pt = win32gui.GetCursorPos()
+            cl = win32gui.GetClientRect(self._hwnd)
+            tl = win32gui.ClientToScreen(self._hwnd, (cl[0], cl[1]))
+            br = win32gui.ClientToScreen(self._hwnd, (cl[2], cl[3]))
+            if tl[0] + 30 <= pt[0] <= br[0] - 30 and tl[1] + 30 <= pt[1] <= br[1] - 30:
+                win32api.SetCursorPos((tl[0] + 5, tl[1] + 5))
+        except Exception:
+            pass
+
     def _release_gdi(self) -> None:
         """Free the cached GDI objects. Safe to call repeatedly.
 

@@ -164,6 +164,7 @@ class VisionAgent(BaseVisionAgent):
         simulate_miss_rate: float = 0.25,
         match_downscale: float = 1.0,
         search_region: Optional[Tuple[float, float, float, float]] = None,
+        target_thresholds: Optional[Dict[str, float]] = None,
         rng: Optional[random.Random] = None,
     ) -> None:
         self.template_dir = template_dir
@@ -174,6 +175,7 @@ class VisionAgent(BaseVisionAgent):
         self.max_detections = max_detections
         self.use_fake_detection = use_fake_detection
         self.simulate_miss_rate = simulate_miss_rate
+        self.target_thresholds = dict(target_thresholds) if target_thresholds else {}
 
         # Cost controls. Template matching is O(pixels), so both of these are
         # direct multipliers on detection time.
@@ -196,6 +198,12 @@ class VisionAgent(BaseVisionAgent):
         self._scaled_cache: Dict[Tuple[str, int, int], np.ndarray] = {}
         # Window sizes already warned about, so the log is not spammed per frame.
         self._warned_aspect: set = set()
+
+    def threshold_for(self, target_name: str) -> float:
+        """Confidence floor for a specific target, falling back to match_threshold."""
+        if self.target_thresholds and target_name in self.target_thresholds:
+            return self.target_thresholds[target_name]
+        return self.match_threshold
 
     # ------------------------------------------------------------ public API
 
@@ -332,7 +340,8 @@ class VisionAgent(BaseVisionAgent):
         window = max(3, (min(th, tw) // 2) | 1)
         neighbourhood_max = cv2.dilate(result, np.ones((window, window), np.uint8))
 
-        peaks = (result >= self.match_threshold) & (result >= neighbourhood_max - 1e-6)
+        threshold = self.threshold_for(target_name)
+        peaks = (result >= threshold) & (result >= neighbourhood_max - 1e-6)
         ys, xs = np.where(peaks)
         if len(xs) == 0:
             return []
@@ -509,3 +518,21 @@ class VisionAgent(BaseVisionAgent):
         results.sort(key=lambda d: d.confidence, reverse=True)
         logger.debug("[fake] %d hits for %s", len(results), target_name)
         return results
+
+
+def check_piggy_status(crop: np.ndarray, min_v: float = 130.0) -> bool:
+    """Determine whether the piggy bank is bright (active) or dim (inactive).
+
+    Measured on live captures: bright active piggy has center body HSV Value V ~ 152-168,
+    while dim inactive piggy has V ~ 89-96.
+    Returns True if bright, False if dim or empty.
+    """
+    if crop is None or crop.size == 0 or not _CV2_AVAILABLE:
+        return False
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h, w = crop.shape[:2]
+    # Sample the central 60% of the crop where the pig body sits.
+    pig_center = hsv[int(h * 0.2) : int(h * 0.8), int(w * 0.2) : int(w * 0.8), 2]
+    if pig_center.size == 0:
+        return False
+    return float(pig_center.mean()) >= min_v

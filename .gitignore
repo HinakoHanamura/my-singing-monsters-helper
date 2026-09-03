@@ -36,10 +36,11 @@ tests/manual/*.png
 # pytest report artifacts, regenerable via tools/run_suite.py
 junit*.xml
 
-# Local-only notes and planning documents. The rules documents that do ship
-# with the repo are the technical ones (calibration, minigame_memory, workflow);
-# the three below stay local. Git history cannot be scrubbed after the fact,
-# so they must never be committed even once.
-.agents/rules/private.md
-.agents/rules/project.md
-.agents/rules/roadmap.md
+# Local-only notes, planning documents, and scratchpad
+.agents/
+scratch/
+
+# Temporarily ignore all markdown documentation
+*.md
+**/*.md
+

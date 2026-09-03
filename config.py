@@ -16,7 +16,16 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+TARGET_COIN = "coin"
+TARGET_DIAMOND = "diamond"
+TARGET_TREATS = "treats"
+TARGET_PIGGY_BANK = "piggy_bank"
+TARGET_MODAL_CONFIRM = "modal_confirm"
+TARGET_MAP_BUTTON = "map_button"
+TARGET_MAP_GO = "map_go"
+TARGET_MAP_YOU_ARE_HERE = "map_you_are_here"
 
 # Normalized rectangle (x1, y1, x2, y2) with values in 0.0..1.0, relative to the
 # client area. Ratios rather than absolute pixels, so one configuration stays
@@ -82,10 +91,10 @@ class ClickConfig:
     # 5px stays comfortably inside it.
     jitter_radius: int = 5
 
-    # Random hold time between button down and up, seconds.
-    # A real button press is rarely shorter than ~20ms, so this is about the
-    # floor before the timing stops resembling a hand at all.
-    press_duration: Tuple[float, float] = (0.02, 0.05)
+    # Hold time between button down and up, seconds.
+    # Set to (0.0, 0.0) so DOWN and UP are dispatched atomically without a gap,
+    # preventing hardware mouse movement from interleaving and converting clicks into drags/pans.
+    press_duration: Tuple[float, float] = (0.0, 0.0)
 
     # Random pause after a completed click, seconds.
     post_click_delay: Tuple[float, float] = (0.03, 0.09)
@@ -100,7 +109,8 @@ class ClickConfig:
     batch_settle_delay: Tuple[float, float] = (0.05, 0.12)
 
     # Send a WM_MOUSEMOVE first; some games only respond to a click after hover.
-    move_before_click: bool = True
+    # Set to False to ensure clicks are direct and atomic without pre-move sleep.
+    move_before_click: bool = False
 
     # Random gap between the move and the button press, seconds.
     pre_press_delay: Tuple[float, float] = (0.008, 0.025)
@@ -204,7 +214,7 @@ class VisionConfig:
     # own camera zoom. Zoom changes sprite size independently of window size, so
     # detection will miss outside the band. Making that robust is separate work;
     # the zoom/pan recordings in captures/ are its test set.
-    scale_steps: Tuple[float, ...] = (0.97, 1.0, 1.03)
+    scale_steps: Tuple[float, ...] = (0.94, 0.97, 1.0, 1.03, 1.06)
 
     # Minimum centre separation for de-duplication, in reference pixels.
     #
@@ -256,6 +266,23 @@ class VisionConfig:
     use_fake_detection: bool = False
     simulate_miss_rate: float = 0.25
 
+    # Per-target confidence thresholds, falling back to match_threshold.
+    target_thresholds: Dict[str, float] = field(
+        default_factory=lambda: {
+            TARGET_COIN: 0.75,
+            TARGET_DIAMOND: 0.62,
+            TARGET_TREATS: 0.65,
+            TARGET_PIGGY_BANK: 0.70,
+            TARGET_MODAL_CONFIRM: 0.68,
+        }
+    )
+
+    # Minimum HSV Value (brightness) in pig body center to be deemed active/bright.
+    piggy_min_brightness_v: float = 130.0
+
+    # Maximum seconds to wait for modal confirmation dialog to appear or disappear.
+    modal_timeout: float = 4.0
+
 
 @dataclass(frozen=True)
 class SafetyConfig:
@@ -272,8 +299,8 @@ class SafetyConfig:
         (0.00, 0.00, 1.00, 0.075),  # top status strip
         (0.00, 0.00, 0.14, 0.17),   # level avatar, top-left
         (0.52, 0.00, 1.00, 0.13),   # currency widgets and the More button
-        (0.00, 0.15, 0.13, 0.80),   # left column: GOALS, timers, ACTIVITIES
-        (0.00, 0.83, 1.00, 1.00),   # bottom button bar
+        (0.00, 0.15, 0.105, 0.80),  # left column: GOALS, timers, ACTIVITIES
+        (0.00, 0.86, 1.00, 1.00),   # bottom button bar
         (0.88, 0.69, 1.00, 0.86),   # COLLECT ALL button
     )
 
@@ -411,6 +438,26 @@ class DiagnosticsConfig:
 
 
 @dataclass(frozen=True)
+class MapConfig:
+    """Map navigation, island card traversal, and swipe gesture configuration."""
+
+    # Timeouts for map loading and island entrance animations.
+    map_timeout: float = 8.0
+    # Standard card pitch in reference resolution 1024x768.
+    card_height: int = 109
+    # Coordinates and parameters for dragging up (scrolling down).
+    drag_x: int = 200
+    drag_start_y: int = 460
+    drag_end_y: int = 365
+    drag_duration: float = 0.45
+    drag_steps: int = 18
+    # Blacklist of island names to skip (case-insensitive).
+    blacklist: List[str] = field(default_factory=list)
+    # Character matching threshold for letter recognizer.
+    letter_match_threshold: float = 0.80
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Aggregate configuration; the single entry point for every layer."""
 
@@ -420,6 +467,7 @@ class AppConfig:
     vision: VisionConfig = field(default_factory=VisionConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
+    map: MapConfig = field(default_factory=MapConfig)
 
 
 DEFAULT_CONFIG = AppConfig()

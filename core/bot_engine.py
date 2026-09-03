@@ -78,7 +78,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
-from config import DEFAULT_CONFIG, AppConfig
+from config import (
+    DEFAULT_CONFIG,
+    TARGET_COIN,
+    TARGET_DIAMOND,
+    TARGET_MODAL_CONFIRM,
+    TARGET_PIGGY_BANK,
+    TARGET_TREATS,
+    AppConfig,
+)
 from core.action_agent import ActionAgent
 from core.click_guard import ClickGuard
 from core.diagnostics import MissRecorder
@@ -92,9 +100,40 @@ from core.geometry import (
     scale_length,
 )
 from core.validators import ValidationContext, build_rule_chain
-from core.vision_agent import BaseVisionAgent, Detection, VisionAgent
+from core.vision_agent import (
+    BaseVisionAgent,
+    Detection,
+    VisionAgent,
+    check_piggy_status,
+)
+from collections import deque
+import cv2
+import difflib
+from core.map_navigator import MapNavigator, ScreenState, IslandCardInfo, hash_distance
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class QueuedIsland:
+    """Item in the monotonic FIFO tour queue."""
+
+    name: str
+    canon_name: str
+    card_hash: int = 0
+    card_hist: Optional[np.ndarray] = None
+
+
+class EngineMode(str, Enum):
+    """Execution modes for the bot engine."""
+
+    COIN = "coin"
+    DIAMOND = "diamond"
+    TREATS = "treats"
+    PIGGY = "piggy"
+    ALL_RESOURCES = "all_resources"
+    MAP_TOUR = "map_tour"
+    TRACK_ISLAND = "track_island"
 
 
 class LogLevel(str, Enum):
@@ -117,10 +156,6 @@ class BotState(str, Enum):
     VERIFYING = "回读验证"
     ERROR = "异常"
     STOPPED = "已停止"
-
-
-# The single hard-coded target for now.
-TARGET_COIN = "coin"
 
 
 def inflate(box: PixelRect, margin: int) -> PixelRect:
@@ -250,10 +285,12 @@ class BotEngine(QThread):
         self,
         config: Optional[AppConfig] = None,
         vision_agent: Optional[BaseVisionAgent] = None,
+        mode: str = EngineMode.COIN,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._cfg = config or DEFAULT_CONFIG
+        self._mode = EngineMode(mode)
         self._rng = random.Random()
 
         # Dependency injection: pass a YoloVisionAgent here and the engine needs
@@ -269,6 +306,7 @@ class BotEngine(QThread):
             simulate_miss_rate=self._cfg.vision.simulate_miss_rate,
             match_downscale=self._cfg.vision.match_downscale,
             search_region=self._cfg.vision.search_region,
+            target_thresholds=self._cfg.vision.target_thresholds,
         )
 
         self._window = GameWindow(
@@ -309,8 +347,18 @@ class BotEngine(QThread):
         self._verify_countdown = 0
         self._verifications = 0
         self._verified_failures = 0
+        self._blacklist: List[str] = list(self._cfg.map.blacklist)
+        self._track_target: str = ""
 
     # ------------------------------------------------------------ public API
+
+    def set_blacklist(self, blacklist: Sequence[str]) -> None:
+        """Update the list of island names to skip during map tours."""
+        self._blacklist = [str(b).strip() for b in blacklist if str(b).strip()]
+
+    def set_track_target(self, target: str) -> None:
+        """Set the target island name for tracking tests."""
+        self._track_target = target.strip()
 
     def stop(self) -> None:
         """Request a stop. Called from the UI thread; returns immediately.
@@ -323,6 +371,10 @@ class BotEngine(QThread):
             self.requestInterruption()
 
     @property
+    def mode(self) -> EngineMode:
+        return self._mode
+
+    @property
     def state(self) -> BotState:
         return self._state
 
@@ -333,6 +385,10 @@ class BotEngine(QThread):
     @property
     def timings(self) -> StageTimings:
         return self._timings
+
+    @property
+    def blacklist(self) -> List[str]:
+        return list(self._blacklist)
 
     # ---------------------------------------------------------- thread body
 
@@ -350,20 +406,40 @@ class BotEngine(QThread):
         self._verifications = 0
         self._verified_failures = 0
 
-        self._announce_startup()
+        if self._mode == EngineMode.MAP_TOUR:
+            self._announce_startup("收集各岛资源任务已启动")
+        elif self._mode == EngineMode.TRACK_ISLAND:
+            self._announce_startup("岛屿追踪测试已启动")
+        elif self._mode == EngineMode.ALL_RESOURCES:
+            self._announce_startup("单岛资源全收测试已启动")
+        elif self._mode == EngineMode.PIGGY:
+            self._announce_startup("小猪储蓄罐任务已启动")
+        elif self._mode == EngineMode.DIAMOND:
+            self._announce_startup("钻石收集任务已启动")
+        elif self._mode == EngineMode.TREATS:
+            self._announce_startup("食物收集任务已启动")
+        else:
+            self._announce_startup("金币挂机引擎已启动")
 
         try:
-            while not self.isInterruptionRequested():
-                self._tick()
-
-                if self._consecutive_errors >= self._cfg.loop.max_consecutive_errors:
-                    self._emit_log(
-                        LogLevel.ERROR,
-                        "连续 %d 轮异常，自动停止以避免空转" % self._consecutive_errors,
-                    )
-                    break
-
-                self._sleep_timed(self._rng.uniform(*self._cfg.loop.tick_interval))
+            if self._mode == EngineMode.MAP_TOUR:
+                self._run_map_tour()
+            elif self._mode == EngineMode.TRACK_ISLAND:
+                self._run_track_island()
+            elif self._mode == EngineMode.ALL_RESOURCES:
+                self._run_all_resources()
+            elif self._mode == EngineMode.PIGGY:
+                self._run_piggy_mode()
+            elif self._mode == EngineMode.DIAMOND:
+                self._collect_target_until_empty(
+                    TARGET_DIAMOND, max_rounds=6, max_consecutive_empty=4
+                )
+            elif self._mode == EngineMode.TREATS:
+                self._collect_target_until_empty(
+                    TARGET_TREATS, max_rounds=30, max_consecutive_empty=4
+                )
+            else:
+                self._run_coin_loop()
 
         except Exception as exc:  # pragma: no cover
             logger.exception("engine main loop crashed")
@@ -391,12 +467,607 @@ class BotEngine(QThread):
             )
             self._emit_log(LogLevel.INFO, "耗时分布: %s" % self._timings.describe(self._rounds))
 
-    def _announce_startup(self) -> None:
+    def _run_coin_loop(self) -> None:
+        """Continuous coin collection loop until interrupted."""
+        while not self.isInterruptionRequested():
+            self._tick()
+
+            if self._consecutive_errors >= self._cfg.loop.max_consecutive_errors:
+                self._emit_log(
+                    LogLevel.ERROR,
+                    "连续 %d 轮异常，自动停止以避免空转" % self._consecutive_errors,
+                )
+                break
+
+            self._sleep_timed(self._rng.uniform(*self._cfg.loop.tick_interval))
+
+    def _run_piggy_mode(self) -> None:
+        """Collect via piggy bank and finish."""
+        self._run_piggy_stage()
+
+    def _run_piggy_stage(self) -> bool:
+        """Attempt to activate and confirm the piggy bank if bright.
+
+        Returns True if the piggy bank was clicked and confirmed closed, False otherwise.
+        """
+        self._set_state(BotState.SEARCHING)
+        if not self._window.ensure_attached():
+            self._emit_log(LogLevel.WARN, "未找到游戏窗口，跳过储蓄罐")
+            return False
+
+        frame = self._timed("capture", self._window.capture)
+        if frame is None:
+            self._emit_log(LogLevel.WARN, "截图失败，跳过储蓄罐")
+            return False
+
+        height, width = frame.shape[:2]
+        client_size = (width, height)
+        scale = scale_factor(client_size, self._cfg.vision.reference_size)
+        self._action.set_scale(scale)
+        self._guard.set_scale(scale)
+
+        # Check if the confirmation modal is already open on screen
+        confirms = self._timed(
+            "detect", self._vision.detect, TARGET_MODAL_CONFIRM, frame
+        )
+        if not confirms:
+            piggies = self._timed(
+                "detect", self._vision.detect, TARGET_PIGGY_BANK, frame
+            )
+            if not piggies:
+                self._emit_log(LogLevel.INFO, "未检测到小猪储蓄罐图标（本岛无储蓄罐或被遮挡），跳过")
+                return False
+
+            piggy = piggies[0]
+            crop = frame[
+                max(0, piggy.y) : min(height, piggy.y + piggy.height),
+                max(0, piggy.x) : min(width, piggy.x + piggy.width),
+            ]
+            is_bright = check_piggy_status(
+                crop, min_v=self._cfg.vision.piggy_min_brightness_v
+            )
+            if not is_bright:
+                self._emit_log(LogLevel.INFO, "小猪储蓄罐处于黯淡状态（无可收集货币），跳过")
+                return False
+
+            self._set_state(BotState.ACTING)
+            self._emit_log(LogLevel.INFO, "检测到高光储蓄罐，执行点击...")
+            if not self._timed(
+                "click", self._action.click, piggy.center[0], piggy.center[1]
+            ):
+                self._emit_log(LogLevel.WARN, "点击储蓄罐失败")
+                return False
+
+            self._clicks += 1
+            self.stats_changed.emit(self._rounds, self._clicks)
+
+        # Wait for modal confirmation button to appear and click with retry until closed
+        self._set_state(BotState.SEARCHING)
+        modal_deadline = time.monotonic() + self._cfg.vision.modal_timeout
+        confirmed_any = False
+
+        while time.monotonic() < modal_deadline and not self.isInterruptionRequested():
+            self._sleep_timed(0.2)
+            mframe = self._timed("capture", self._window.capture)
+            if mframe is None:
+                continue
+
+            confirms = self._timed(
+                "detect", self._vision.detect, TARGET_MODAL_CONFIRM, mframe
+            )
+            if confirms:
+                confirm_btn = confirms[0]
+                self._set_state(BotState.ACTING)
+                self._emit_log(LogLevel.INFO, "检测到确认弹窗，点击绿色确认按钮...")
+                self._timed(
+                    "click",
+                    self._action.click,
+                    confirm_btn.center[0],
+                    confirm_btn.center[1],
+                )
+                self._clicks += 1
+                self.stats_changed.emit(self._rounds, self._clicks)
+                confirmed_any = True
+                self._sleep_timed(0.35)
+                continue
+
+            if confirmed_any:
+                self._emit_log(LogLevel.SUCCESS, "储蓄罐收集完成，确认弹窗已关闭")
+                self._sleep_timed(0.4)
+                return True
+
+        if not confirmed_any:
+            self._emit_log(LogLevel.WARN, "等待确认弹窗超时，未发现确认按钮")
+            return False
+
+        self._emit_log(LogLevel.SUCCESS, "储蓄罐收集完成")
+        self._sleep_timed(0.4)
+        return True
+
+    def _collect_target_until_empty(
+        self,
+        target_name: str,
+        max_rounds: int = 30,
+        max_consecutive_empty: int = 4,
+    ) -> int:
+        """Collect specified target iteratively until empty or max rounds reached."""
+        target_labels = {
+            TARGET_COIN: "金币",
+            TARGET_DIAMOND: "钻石",
+            TARGET_TREATS: "食物",
+        }
+        label = target_labels.get(target_name, target_name)
+        consecutive_empty = 0
+        clicks_start = self._clicks
+
+        for _ in range(max_rounds):
+            if self.isInterruptionRequested():
+                break
+
+            self._rounds += 1
+            self.stats_changed.emit(self._rounds, self._clicks)
+
+            if not self._window.ensure_attached():
+                self._consecutive_errors += 1
+                self._sleep_timed(self._cfg.loop.retry_interval)
+                continue
+
+            frame = self._timed("capture", self._window.capture)
+            if frame is None:
+                self._consecutive_errors += 1
+                self._sleep_timed(self._cfg.loop.retry_interval)
+                continue
+
+            height, width = frame.shape[:2]
+            client_size = (width, height)
+            scale = scale_factor(client_size, self._cfg.vision.reference_size)
+            self._action.set_scale(scale)
+            self._guard.set_scale(scale)
+
+            self._set_state(BotState.SEARCHING)
+            self._guard.begin_frame()
+            targets = self._timed("detect", self._vision.detect, target_name, frame)
+            self._guard.observe(targets)
+
+            if not targets:
+                consecutive_empty += 1
+                self._emit_log(
+                    LogLevel.INFO,
+                    f"未发现可收集的{label}（{consecutive_empty}/{max_consecutive_empty}）",
+                )
+                if consecutive_empty >= max_consecutive_empty:
+                    break
+                self._sleep_timed(self._rng.uniform(*self._cfg.loop.tick_interval))
+                continue
+
+            consecutive_empty = 0
+            self._set_state(BotState.VALIDATING)
+            candidates, rejections = self._timed(
+                "validate",
+                self._filter_candidates,
+                targets,
+                frame,
+                client_size,
+                scale,
+                target_name,
+            )
+            self._last_rejections = rejections
+
+            if not candidates:
+                summary = f"识别到 {len(targets)} 个{label}，通过 0 个"
+                if rejections:
+                    summary += f" ｜ 过滤: {rejections.describe()}"
+                self._emit_log(LogLevel.INFO, summary)
+                self._sleep_timed(self._rng.uniform(*self._cfg.loop.tick_interval))
+                continue
+
+            batch = select_independent(
+                candidates,
+                self._cfg.loop.max_clicks_per_tick,
+                scale_length(self._cfg.loop.click_separation_margin, scale, minimum=0),
+            )
+            self._last_batch_size = len(batch)
+
+            summary = (
+                f"识别到 {len(targets)} 个{label}，通过 {len(candidates)} 个，本轮点 {len(batch)} 个"
+            )
+            if len(batch) < len(candidates):
+                summary += "（其余重叠，留待下轮）"
+            if rejections:
+                summary += f" ｜ 过滤: {rejections.describe()}"
+            self._emit_log(LogLevel.INFO, summary)
+
+            self._click_batch(batch, scale, target_name=target_name)
+            self.stats_changed.emit(self._rounds, self._clicks)
+            self._sleep_timed(self._rng.uniform(*self._cfg.loop.tick_interval))
+
+        return self._clicks - clicks_start
+
+    def _run_all_resources(self) -> None:
+        """Run the composite resource collection pipeline in sequence."""
+        self._emit_log(LogLevel.INFO, "===== 开始执行「资源全收」流水线 =====")
+
+        # Stage 1: Piggy Bank
+        if self.isInterruptionRequested():
+            return
+        self._emit_log(LogLevel.INFO, "【阶段 1/4】 检查小猪储蓄罐...")
+        piggy_ok = self._run_piggy_stage()
+        if piggy_ok:
+            self._emit_log(LogLevel.SUCCESS, "【阶段 1/4】 储蓄罐全收完成")
+        else:
+            self._emit_log(LogLevel.INFO, "【阶段 1/4】 储蓄罐已跳过，继续后续流程")
+
+        # Stage 2: Diamond
+        if self.isInterruptionRequested():
+            return
+        self._emit_log(LogLevel.INFO, "【阶段 2/4】 收集钻石...")
+        d_clicks = self._collect_target_until_empty(
+            TARGET_DIAMOND, max_rounds=6, max_consecutive_empty=4
+        )
+        self._emit_log(LogLevel.INFO, f"【阶段 2/4】 钻石收集完毕（点击 {d_clicks} 次）")
+
+        # Stage 3: Treats
+        if self.isInterruptionRequested():
+            return
+        self._emit_log(LogLevel.INFO, "【阶段 3/4】 收集食物 (Treats)...")
+        t_clicks = self._collect_target_until_empty(
+            TARGET_TREATS, max_rounds=30, max_consecutive_empty=4
+        )
+        self._emit_log(LogLevel.INFO, f"【阶段 3/4】 食物收集完毕（点击 {t_clicks} 次）")
+
+        # Stage 4: Coins
+        if self.isInterruptionRequested():
+            return
+        self._emit_log(LogLevel.INFO, "【阶段 4/4】 收集金币...")
+        c_clicks = self._collect_target_until_empty(
+            TARGET_COIN, max_rounds=40, max_consecutive_empty=4
+        )
+        self._emit_log(LogLevel.INFO, f"【阶段 4/4】 金币收集完毕（点击 {c_clicks} 次）")
+
+        self._emit_log(
+            LogLevel.SUCCESS,
+            f"===== 资源全收流水线已完成 ｜ 总点击 {self._clicks} 次 =====",
+        )
+
+    def _run_map_tour(self) -> None:
+        """Execute multi-island traversal with blacklist filtering and full resource collection."""
+        self._set_state(BotState.SEARCHING)
+        self._emit_log(LogLevel.INFO, "===== 开始执行「收集各岛资源」任务 =====")
+
+        nav = MapNavigator(
+            action_agent=self._action,
+            window=self._window,
+            config=self._cfg,
+        )
+
+        if not self._window.ensure_attached():
+            self._emit_log(LogLevel.ERROR, "未能连接到游戏窗口，退出巡岛")
+            return
+
+        frame = self._timed("capture", self._window.capture)
+        if frame is None:
+            self._emit_log(LogLevel.ERROR, "未能捕获游戏画面，退出巡岛")
+            return
+
+        visited_names: Set[str] = set()
+        visited_hashes: List[int] = []
+        island_queue: deque[QueuedIsland] = deque()
+        last_anchor: Optional[QueuedIsland] = None
+
+        def words_match(a: str, b: str) -> bool:
+            if a == b:
+                return True
+            if len(a) <= 4 and len(b) <= 4 and a[0] != b[0]:
+                return False
+            return difflib.SequenceMatcher(None, a, b).ratio() >= 0.70
+
+        def names_fuzzy_match(s1: str, s2: str) -> bool:
+            if not s1 or not s2:
+                return False
+            c1 = s1.strip().lower()
+            c2 = s2.strip().lower()
+            if c1 == c2:
+                return True
+            w1 = c1.split()
+            w2 = c2.split()
+            if len(w1) > 1 and len(w2) > 1:
+                if len(w1) != len(w2):
+                    return False
+                return all(words_match(a, b) for a, b in zip(w1, w2))
+            return words_match(c1, c2)
+
+        def match_card_to_island(card: IslandCardInfo, target: QueuedIsland) -> bool:
+            # 1. Perceptual dHash match (visual identity - primary invariant)
+            if card.card_hash != 0 and target.card_hash != 0:
+                if hash_distance(card.card_hash, target.card_hash) <= 6:
+                    return True
+
+            c_raw = card.name.strip().lower()
+            t_raw = target.name.strip().lower()
+
+            # 2. Text name matching (exact or structural fuzzy)
+            if names_fuzzy_match(c_raw, t_raw):
+                return True
+
+            return False
+
+        def is_card_already_visited(card: IslandCardInfo) -> bool:
+            # 1. Perceptual dHash check (primary visual invariant - unconditional deduplication)
+            if card.card_hash != 0:
+                for vh in visited_hashes:
+                    if hash_distance(card.card_hash, vh) <= 6:
+                        return True
+
+            c_raw = card.name.strip().lower()
+
+            # 2. Text name matching against visited names
+            if c_raw:
+                for v in visited_names:
+                    if names_fuzzy_match(c_raw, v):
+                        return True
+
+            return False
+
+        def mark_card_visited(card: IslandCardInfo) -> None:
+            clean_name = card.name.strip().lower()
+            if clean_name:
+                visited_names.add(clean_name)
+            if card.card_hash != 0:
+                visited_hashes.append(card.card_hash)
+
+        def scan_and_enqueue_downward(cards_list: List[IslandCardInfo]) -> int:
+            nonlocal last_anchor
+            # 1. Lock anchor vertical position on current screen
+            anchor_y = -1
+            if last_anchor is not None:
+                for c in cards_list:
+                    if match_card_to_island(c, last_anchor):
+                        anchor_y = c.rect[1]
+                        break
+
+            # 2. Fuzzy range: mask out everything above anchor; search entire region below
+            downward_cards: List[IslandCardInfo] = []
+            for c in cards_list:
+                if anchor_y >= 0 and c.rect[1] <= anchor_y + 10:
+                    continue
+                downward_cards.append(c)
+
+            # 3. Sort candidates strictly by Y axis (top to bottom)
+            downward_cards.sort(key=lambda c: c.rect[1])
+
+            # 4. Enqueue new unvisited islands in order
+            enqueued = 0
+            for c in downward_cards:
+                # Guard against enqueuing partially clipped bottom boundary slivers
+                if not c.is_fully_visible:
+                    continue
+                if not c.name or len(c.name.strip()) < 2:
+                    continue
+                if is_card_already_visited(c):
+                    continue
+
+                # Dual deduplication against items currently in queue
+                already_queued = any(
+                    (c.card_hash != 0 and q.card_hash != 0 and hash_distance(c.card_hash, q.card_hash) <= 6)
+                    or match_card_to_island(c, q)
+                    for q in island_queue
+                )
+                if already_queued:
+                    continue
+
+                item = QueuedIsland(
+                    name=c.name,
+                    canon_name=c.name,
+                    card_hash=c.card_hash,
+                    card_hist=c.card_hist,
+                )
+                island_queue.append(item)
+                enqueued += 1
+                self._emit_log(
+                    LogLevel.INFO,
+                    "【队列排队】 发现新岛屿 '%s'，加入待巡检队列（队列长度：%d）" % (c.name, len(island_queue)),
+                )
+            return enqueued
+
+        cur_state = nav.detect_state(frame)
+
+        if cur_state != ScreenState.MAP:
+            self._emit_log(LogLevel.INFO, "正在打开地图界面以开始巡岛…")
+            if not nav.open_map():
+                self._emit_log(LogLevel.ERROR, "未能进入地图界面，退出巡岛")
+                return
+        else:
+            self._emit_log(LogLevel.INFO, "检测到当前处于地图界面，执行地图初始化…")
+
+        # Park cursor to eliminate hover glow effects before list scanning
+        self._action.park_cursor()
+
+        # Map Initialization: scroll to the very top so traversal begins at card 0
+        self._emit_log(LogLevel.INFO, "【地图初始化】 正在滑动置顶岛屿列表…")
+        nav.scroll_to_top()
+        self._sleep_timed(0.4)
+
+        consecutive_no_progress = 0
+        target_miss_count = 0
+
+        while not self.isInterruptionRequested():
+            nav.wait_for_list_stable(timeout=1.2)
+
+            frame = self._timed("capture", self._window.capture)
+            if frame is None:
+                break
+
+            cards = nav.get_visible_cards(frame)
+            if not cards:
+                self._emit_log(LogLevel.WARN, "未检测到可见岛屿卡片，尝试滑动列表…")
+                nav.scroll_down()
+                continue
+
+            # Update queue with cards discovered below current anchor
+            scan_and_enqueue_downward(cards)
+
+            # Check if queue is empty
+            if not island_queue:
+                self._emit_log(LogLevel.INFO, "当前视野待访队列为空，向下滑动探索后续新岛屿…")
+                nav.scroll_down()
+                nav.wait_for_list_stable(timeout=1.2)
+                fresh_frame = self._timed("capture", self._window.capture)
+                if fresh_frame is None:
+                    break
+                fresh_cards = nav.get_visible_cards(fresh_frame)
+                new_found = scan_and_enqueue_downward(fresh_cards) if fresh_cards else 0
+
+                if new_found == 0:
+                    consecutive_no_progress += 1
+                    if consecutive_no_progress >= 2:
+                        self._emit_log(
+                            LogLevel.SUCCESS,
+                            "【巡岛完成】 待访队列已清空且向下滑动无新岛屿，所有岛屿收集完毕！",
+                        )
+                        break
+                else:
+                    consecutive_no_progress = 0
+                continue
+
+            # Strict FIFO: target next island at the head of queue
+            target = island_queue[0]
+            target_disp_name = target.name
+
+            # Locate target card on current screen
+            target_card: Optional[IslandCardInfo] = None
+            for c in cards:
+                if match_card_to_island(c, target):
+                    target_card = c
+                    break
+
+            if target_card is not None and target_card.is_fully_visible:
+                # Target is fully visible and ready for interaction!
+                island_queue.popleft()
+                target_miss_count = 0
+
+                # Check blacklist
+                if nav._recognizer.is_blacklisted(target_disp_name, self._blacklist):
+                    self._emit_log(
+                        LogLevel.WARN,
+                        "【黑名单跳过】 岛屿 '%s' 在屏蔽列表中，自动跳过" % target_disp_name,
+                    )
+                    mark_card_visited(target_card)
+                    last_anchor = target
+                    continue
+
+                # Select target island card
+                self._emit_log(LogLevel.INFO, "【前往岛屿】 正在选中卡片 '%s'…" % target_disp_name)
+                nav.select_island(target_card)
+                self._sleep_timed(0.18)
+
+                self._emit_log(LogLevel.INFO, "【进入岛屿】 正在确认进入 '%s'…" % target_disp_name)
+                if not nav.enter_selected_island():
+                    self._emit_log(LogLevel.WARN, "未能进入岛屿 '%s'，跳过该岛屿" % target_disp_name)
+                    mark_card_visited(target_card)
+                    last_anchor = target
+                    continue
+
+                # Inside island: run full resource collection pipeline
+                self._emit_log(
+                    LogLevel.SUCCESS,
+                    "【岛上采集】 已成功进入 '%s'，开始执行资源全收…" % target_disp_name,
+                )
+                self._run_all_resources()
+
+                if self.isInterruptionRequested():
+                    break
+
+                # Return to map with retry
+                self._emit_log(LogLevel.INFO, "【返回地图】 资源收集完毕，正在返回地图界面…")
+                return_ok = False
+                for _ in range(3):
+                    if nav.open_map():
+                        return_ok = True
+                        break
+                    self._sleep_timed(0.5)
+
+                if not return_ok:
+                    self._emit_log(LogLevel.ERROR, "未能从岛屿返回地图，巡岛中止")
+                    return
+
+                # Mark visited and update anchor
+                mark_card_visited(target_card)
+                last_anchor = target
+
+                # Synchronize post-return state: register the card matching target on returned screen
+                post_frame = self._timed("capture", self._window.capture)
+                if post_frame is not None:
+                    post_cards = nav.get_visible_cards(post_frame)
+                    if post_cards:
+                        for pc in post_cards:
+                            if match_card_to_island(pc, target):
+                                mark_card_visited(pc)
+                                break
+                continue
+            else:
+                if target_card is not None:
+                    # Target is visible in viewport but partially clipped by bottom edge: advance slightly to bring it into full view
+                    self._emit_log(
+                        LogLevel.INFO,
+                        "待访目标 '%s' 位于下方边缘，微距推进至全貌视野…" % target_disp_name,
+                    )
+                    nav.scroll_down()
+                    continue
+                else:
+                    target_miss_count += 1
+                    if target_miss_count <= 2:
+                        self._emit_log(
+                            LogLevel.INFO,
+                            "待访目标 '%s' 暂未在当前视野出现，向下推进寻找（尝试 %d/2）…" % (target_disp_name, target_miss_count),
+                        )
+                        nav.scroll_down()
+                        continue
+                    else:
+                        # Target missing after 2 consecutive downward scrolls; pop it to break endless scroll cascade
+                        self._emit_log(
+                            LogLevel.WARN,
+                            "待访目标 '%s' 连续滑动未现身，已从队列移出以防阻碍后续岛屿" % target_disp_name,
+                        )
+                        island_queue.popleft()
+                        target_miss_count = 0
+                        continue
+
+    def _run_track_island(self) -> None:
+        """Search the map list for a specified target island and enter it."""
+        self._set_state(BotState.SEARCHING)
+        target = self._track_target
+        if not target:
+            self._emit_log(LogLevel.WARN, "未指定目标岛屿名称，退出追踪测试")
+            return
+
+        self._emit_log(LogLevel.INFO, f"【岛屿追踪】 开始检索目标岛屿：'{target}'…")
+        nav = MapNavigator(
+            action_agent=self._action,
+            window=self._window,
+            config=self._cfg,
+        )
+
+        if not self._window.ensure_attached():
+            self._emit_log(LogLevel.ERROR, "未能连接到游戏窗口，退出追踪测试")
+            return
+
+        def on_located(card_name: str) -> None:
+            self._emit_log(LogLevel.INFO, f"【岛屿追踪】 已在列表中定位到目标卡片 '{card_name}'，正在进入…")
+
+        ok, status = nav.find_and_enter_island(target, on_located=on_located)
+        if ok:
+            self._emit_log(LogLevel.SUCCESS, f"【追踪成功】 已成功定位并进入目标岛屿：'{target}'！")
+        elif status == "entry_timeout":
+            self._emit_log(LogLevel.ERROR, f"【进入超时】 已在列表中定位并选中目标岛屿：'{target}'，但确认进入超时！")
+        else:
+            self._emit_log(LogLevel.ERROR, f"【追踪失败】 列表中未检索到匹配的岛屿：'{target}'")
+
+    def _announce_startup(self, title: str = "挂机引擎已启动") -> None:
         """One-time banner. Prints the settings that most often explain a miss."""
         vision = self._cfg.vision
         safety = self._cfg.safety
         loop = self._cfg.loop
-        self._emit_log(LogLevel.INFO, "挂机引擎已启动")
+        self._emit_log(LogLevel.INFO, title)
         self._emit_log(
             LogLevel.INFO,
             "目标窗口: %s ｜ 识别器: %s"
@@ -568,15 +1239,16 @@ class BotEngine(QThread):
 
     def _filter_candidates(
         self,
-        coins: Sequence[Detection],
+        targets: Sequence[Detection],
         frame: np.ndarray,
         client_size: Tuple[int, int],
         scale: float,
+        target_name: str = TARGET_COIN,
     ) -> Tuple[List[Detection], RejectionStats]:
         """Run the rule chain and the guard; return survivors plus a reason tally."""
         # Neighbour categories are detected on demand, so a config without such
         # rules pays nothing.
-        detections: Dict[str, List[Detection]] = {TARGET_COIN: list(coins)}
+        detections: Dict[str, List[Detection]] = {target_name: list(targets)}
         for name in self._context_targets:
             detections[name] = self._vision.detect(name, frame)
 
@@ -590,32 +1262,43 @@ class BotEngine(QThread):
         candidates: List[Detection] = []
         rejections = RejectionStats()
 
-        for coin in coins:
-            verdict = self._rules.evaluate(coin, ctx)
+        for target in targets:
+            verdict = self._rules.evaluate(target, ctx)
             if not verdict.ok:
                 rejections.add(verdict.code, verdict.label)
-                logger.debug("rejected %s: %s", coin.center, verdict.describe())
+                logger.debug("rejected %s: %s", target.center, verdict.describe())
                 continue
 
-            blocked = self._guard.status(coin)
+            blocked = self._guard.status(target)
             if blocked is not None:
                 rejections.add(blocked.code, blocked.label)
-                logger.debug("guard blocked %s: %s", coin.center, blocked.message)
+                logger.debug("guard blocked %s: %s", target.center, blocked.message)
                 continue
 
-            candidates.append(coin)
+            candidates.append(target)
 
         return candidates, rejections
 
     # ------------------------------------------------------------- clicking
 
-    def _click_batch(self, batch: Sequence[Detection], scale: float) -> None:
+    def _click_batch(
+        self,
+        batch: Sequence[Detection],
+        scale: float,
+        target_name: str = TARGET_COIN,
+    ) -> None:
         recheck = (
             self._cfg.safety.recheck_before_batch_click
             and self._cfg.loop.max_clicks_per_tick > 1
         )
+        labels = {
+            TARGET_COIN: "金币",
+            TARGET_DIAMOND: "钻石",
+            TARGET_TREATS: "食物",
+        }
+        target_label = labels.get(target_name, "目标")
 
-        for index, coin in enumerate(batch):
+        for index, item in enumerate(batch):
             if self.isInterruptionRequested():
                 return
 
@@ -627,17 +1310,19 @@ class BotEngine(QThread):
                 if self.isInterruptionRequested():
                     return
 
-                if recheck and not self._still_present(coin, scale):
+                if recheck and not self._still_present(
+                    item, scale, target_name=target_name
+                ):
                     self._stale_skips += 1
                     self._emit_log(
                         LogLevel.WARN,
                         "%s 的坐标已过期（画面可能移动过），跳过，留待下轮"
-                        % (coin.center,),
+                        % (item.center,),
                     )
                     continue
 
             self._set_state(BotState.ACTING)
-            point = coin.center
+            point = item.center
             if not self._timed("click", self._action.click, point[0], point[1]):
                 self._consecutive_errors += 1
                 self._emit_log(LogLevel.WARN, "点击 %s 投递失败" % (point,))
@@ -648,13 +1333,15 @@ class BotEngine(QThread):
             self._guard.register_click(point)
             self._emit_log(
                 LogLevel.SUCCESS,
-                "已点击金币 %s（置信度 %.2f）" % (point, coin.confidence),
+                "已点击%s %s（置信度 %.2f）" % (target_label, point, item.confidence),
             )
 
             if self._should_verify():
-                self._verify_click(point)
+                self._verify_click(point, target_name=target_name)
 
-    def _still_present(self, coin: Detection, scale: float) -> bool:
+    def _still_present(
+        self, item: Detection, scale: float, target_name: str = TARGET_COIN
+    ) -> bool:
         """Confirm a batched target is still where the round's frame said it was.
 
         Returns False when there is no evidence, including when the capture
@@ -666,8 +1353,8 @@ class BotEngine(QThread):
             return False
 
         tolerance = scale_length(self._cfg.safety.position_tolerance, scale)
-        target = coin.center
-        found = self._timed("detect", self._vision.detect, TARGET_COIN, frame)
+        target = item.center
+        found = self._timed("detect", self._vision.detect, target_name, frame)
         for detection in found:
             if distance(target, detection.center) <= tolerance:
                 return True
@@ -696,11 +1383,11 @@ class BotEngine(QThread):
             return True
         return False
 
-    def _verify_click(self, point: Point) -> None:
+    def _verify_click(self, point: Point, target_name: str = TARGET_COIN) -> None:
         """Re-read a frame after clicking to confirm the target actually vanished.
 
         This is the only self-correcting part of the anti-misclick stack: if a
-        position keeps surviving clicks it was never a coin, and the guard bans
+        position keeps surviving clicks it was never a target, and the guard bans
         it so the bot stops spinning on the same spot.
         """
         self._set_state(BotState.VERIFYING)
@@ -722,7 +1409,7 @@ class BotEngine(QThread):
 
         still_there = any(
             distance(point, d.center) <= tolerance
-            for d in self._vision.detect(TARGET_COIN, frame)
+            for d in self._vision.detect(target_name, frame)
         )
         self._timings.add("verify", time.perf_counter() - started)
 

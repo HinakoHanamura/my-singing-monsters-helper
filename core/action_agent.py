@@ -114,7 +114,8 @@ class ActionAgent:
                 self._send(
                     hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam
                 )
-                self._sleep_in_range(self._cfg.press_duration)
+                if self._cfg.press_duration[1] > 0:
+                    self._sleep_in_range(self._cfg.press_duration)
                 self._send(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
 
             logger.debug(
@@ -128,6 +129,96 @@ class ActionAgent:
         # Random pause so consecutive actions are not back to back.
         self._sleep_in_range(self._cfg.post_click_delay)
         return True
+
+    def drag(
+        self,
+        start_x: int,
+        start_y: int,
+        end_x: int,
+        end_y: int,
+        duration: float = 0.25,
+        steps: int = 10,
+    ) -> bool:
+        """Drag smoothly from (start_x, start_y) to (end_x, end_y).
+
+        Args:
+            start_x, start_y: drag start coordinates in client pixels.
+            end_x, end_y: drag end coordinates in client pixels.
+            duration: total duration of the drag in seconds.
+            steps: number of intermediate mouse move messages.
+
+        Returns:
+            True if delivered successfully, False otherwise.
+        """
+        if not self._window.ensure_attached():
+            logger.warning("target window unavailable; drag cancelled")
+            return False
+
+        hwnd = self._window.hwnd
+        if hwnd is None:
+            return False
+
+        sx, sy = self._humanize_point(start_x, start_y)
+        ex, ey = self._humanize_point(end_x, end_y)
+
+        steps = max(2, steps)
+        step_dt = duration / steps if duration > 0 else 0.01
+
+        try:
+            with dpi_unaware_thread():
+                # Move to start position
+                start_lparam = win32api.MAKELONG(sx, sy)
+                self._send(hwnd, win32con.WM_MOUSEMOVE, 0, start_lparam)
+                self._sleep_in_range((0.02, 0.04))
+
+                # Mouse down at start position
+                self._send(
+                    hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, start_lparam
+                )
+                self._sleep_in_range((0.02, 0.04))
+
+                # Interpolate moves
+                for i in range(1, steps + 1):
+                    alpha = i / steps
+                    cx = int(round(sx + (ex - sx) * alpha))
+                    cy = int(round(sy + (ey - sy) * alpha))
+                    move_lparam = win32api.MAKELONG(cx, cy)
+                    self._send(
+                        hwnd, win32con.WM_MOUSEMOVE, win32con.MK_LBUTTON, move_lparam
+                    )
+                    time.sleep(step_dt)
+
+                # Settle at destination before release to bleed off kinetic velocity (eliminates inertial fling)
+                time.sleep(0.18)
+
+                # Mouse up at end position
+                end_lparam = win32api.MAKELONG(ex, ey)
+                self._send(hwnd, win32con.WM_LBUTTONUP, 0, end_lparam)
+
+            logger.debug(
+                "dragged from (%s, %s) to (%s, %s)", sx, sy, ex, ey
+            )
+        except Exception:
+            logger.exception("failed to deliver drag messages")
+            return False
+
+        self._sleep_in_range(self._cfg.post_click_delay)
+        return True
+
+    def park_cursor(self) -> bool:
+        """Move cursor to a safe neutral coordinate to clear hover glow effects."""
+        if not self._window.ensure_attached():
+            return False
+        hwnd = self._window.hwnd
+        if hwnd is None:
+            return False
+        try:
+            with dpi_unaware_thread():
+                lparam = win32api.MAKELONG(10, 10)
+                self._send(hwnd, win32con.WM_MOUSEMOVE, 0, lparam)
+            return True
+        except Exception:
+            return False
 
     # ---------------------------------------------------------- humanisation
 
