@@ -71,7 +71,7 @@ import logging
 import random
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -349,6 +349,9 @@ class BotEngine(QThread):
         self._verified_failures = 0
         self._blacklist: List[str] = list(self._cfg.map.blacklist)
         self._track_target: str = ""
+        self._reset_map_to_top: bool = True
+        self._init_brake_mode: str = getattr(self._cfg.map, "init_brake_mode", "dynamic")
+        self._first_island_name: str = getattr(self._cfg.map, "first_island_name", "Plant Island")
 
     # ------------------------------------------------------------ public API
 
@@ -359,6 +362,15 @@ class BotEngine(QThread):
     def set_track_target(self, target: str) -> None:
         """Set the target island name for tracking tests."""
         self._track_target = target.strip()
+
+    def set_reset_map_to_top(self, enable: bool) -> None:
+        """Set whether to auto-scroll map list to top on tour initialization."""
+        self._reset_map_to_top = bool(enable)
+
+    def set_map_init_brake(self, mode: str, first_island_name: str = "Plant Island") -> None:
+        """Set map list initialization brake mode ('dynamic' or 'first_island')."""
+        self._init_brake_mode = str(mode)
+        self._first_island_name = str(first_island_name).strip()
 
     def stop(self) -> None:
         """Request a stop. Called from the UI thread; returns immediately.
@@ -734,10 +746,15 @@ class BotEngine(QThread):
         self._set_state(BotState.SEARCHING)
         self._emit_log(LogLevel.INFO, "===== 开始执行「收集各岛资源」任务 =====")
 
+        map_cfg = replace(
+            self._cfg.map,
+            init_brake_mode=getattr(self, "_init_brake_mode", "dynamic"),
+            first_island_name=getattr(self, "_first_island_name", "Plant Island"),
+        )
         nav = MapNavigator(
             action_agent=self._action,
             window=self._window,
-            config=self._cfg,
+            config=replace(self._cfg, map=map_cfg),
         )
 
         if not self._window.ensure_attached():
@@ -883,9 +900,13 @@ class BotEngine(QThread):
         self._action.park_cursor()
 
         # Map Initialization: scroll to the very top so traversal begins at card 0
-        self._emit_log(LogLevel.INFO, "【地图初始化】 正在滑动置顶岛屿列表…")
-        nav.scroll_to_top()
-        self._sleep_timed(0.4)
+        if self._reset_map_to_top:
+            if getattr(self, "_init_brake_mode", "dynamic") == "first_island":
+                self._emit_log(LogLevel.INFO, f"【地图初始化】 正在滑动置顶至目标首岛 '{getattr(self, '_first_island_name', 'Plant Island')}'…")
+            else:
+                self._emit_log(LogLevel.INFO, "【地图初始化】 正在自适应滑动置顶岛屿列表…")
+            nav.scroll_to_top()
+            self._sleep_timed(0.4)
 
         consecutive_no_progress = 0
         target_miss_count = 0

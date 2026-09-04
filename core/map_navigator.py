@@ -118,32 +118,54 @@ class MapNavigator:
         self._roi_map_btn = DynamicROI("map_button", margin_x=60, margin_y=60)
         self._roi_close_btn = DynamicROI("map_close_or_back", margin_x=60, margin_y=60)
 
+    def _get_scale_steps(self, frame: np.ndarray) -> Tuple[float, ...]:
+        """Compute multi-scale factors relative to 1024x768 reference resolution."""
+        if frame is None or frame.size == 0:
+            return (1.0,)
+        h, w = frame.shape[:2]
+        base_s = h / 768.0
+        return (base_s * 0.94, base_s * 0.97, base_s, base_s * 1.03, base_s * 1.06)
+
     # -------------------------------------------------------- State Detection
 
     def detect_state(self, frame: np.ndarray) -> ScreenState:
         """Detect whether the current frame is inside an island, map, or loading.
 
         Zero fixed coordinates: searches dynamically using DynamicROI
-        (full global scan initially or on fallback, localized dynamic ROI once memorized).
+        with multi-scale adaptation and automatic global scan fallback.
         """
         if frame is None or frame.size == 0:
             return ScreenState.UNKNOWN
 
         h, w = frame.shape[:2]
+        scales = self._get_scale_steps(frame)
 
         # 1. Check for Island view: MAP button on bottom toolbar
         if self._map_btn_tmpl is not None:
-            map_res = self._roi_map_btn.match(frame, self._map_btn_tmpl, threshold=0.70)
+            map_search_roi = (int(h * 0.65), h, 0, w)
+            map_res = self._roi_map_btn.match(
+                frame, self._map_btn_tmpl, threshold=0.60, scales=scales, search_roi=map_search_roi
+            )
             if map_res is not None:
                 return ScreenState.ISLAND
 
-        # 2. Check for Map view: CLOSE button on top right or BACK button
+        # 2. Check for Map view: CLOSE button on bottom toolbar or top right, or BACK button
         if self._close_btn_tmpl is not None:
-            close_res = self._roi_close_btn.match(frame, self._close_btn_tmpl, threshold=0.58)
+            close_search_roi = (int(h * 0.60), h, int(w * 0.60), w)
+            close_res = self._roi_close_btn.match(
+                frame, self._close_btn_tmpl, threshold=0.58, scales=scales, search_roi=close_search_roi
+            )
+            if close_res is None:
+                close_res = self._roi_close_btn.match(
+                    frame, self._close_btn_tmpl, threshold=0.58, scales=scales
+                )
             if close_res is not None:
                 return ScreenState.MAP
+
         if self._back_btn_tmpl is not None:
-            back_res = self._roi_close_btn.match(frame, self._back_btn_tmpl, threshold=0.88)
+            back_res = self._roi_close_btn.match(
+                frame, self._back_btn_tmpl, threshold=0.88, scales=scales
+            )
             if back_res is not None:
                 return ScreenState.MAP
 
@@ -180,65 +202,112 @@ class MapNavigator:
 
     # ---------------------------------------------------- High-Level Commands
 
-    def open_map(self) -> bool:
-        """From island view, click the MAP button and wait for the map interface."""
-        frame = self._window.capture()
-        if frame is None:
-            return False
+    def open_map(self, timeout: float = 6.0) -> bool:
+        """From island view, click the MAP button and wait for the map interface.
 
-        # Fast check: already on map screen?
-        if self.detect_state(frame) == ScreenState.MAP or len(self.get_visible_cards(frame)) >= 2:
-            logger.info("already on map screen")
+        Active retry mechanism: continuously checks state, locates the MAP button
+        with multi-scale adaptation, clicks it, and confirms entry.
+        """
+        deadline = time.monotonic() + timeout
+        last_click_time = 0.0
+
+        while time.monotonic() < deadline:
+            frame = self._window.capture()
+            if frame is None:
+                time.sleep(0.1)
+                continue
+
+            # Fast check: already on map screen?
+            if self.detect_state(frame) == ScreenState.MAP or len(self.get_visible_cards(frame)) >= 2:
+                logger.info("map screen confirmed active")
+                self.wait_for_list_stable(timeout=1.2)
+                return True
+
+            if self._map_btn_tmpl is None:
+                logger.error("MAP button template not available")
+                return False
+
+            h, w = frame.shape[:2]
+            scales = self._get_scale_steps(frame)
+            search_roi = (int(h * 0.65), h, 0, w)
+            match_res = self._roi_map_btn.match(
+                frame, self._map_btn_tmpl, threshold=0.58, scales=scales, search_roi=search_roi
+            )
+            if match_res is None:
+                match_res = self._roi_map_btn.match(
+                    frame, self._map_btn_tmpl, threshold=0.58, scales=scales
+                )
+
+            now = time.monotonic()
+            if match_res is not None:
+                click_x, click_y = match_res.center
+                if now - last_click_time >= 0.5:
+                    logger.info("clicking detected MAP button at (%d, %d)", click_x, click_y)
+                    self._action.click(click_x, click_y)
+                    last_click_time = now
+
+                    # Wait for map screen to load and list to settle
+                    if self.wait_for_state(ScreenState.MAP, timeout=2.5):
+                        self.wait_for_list_stable(timeout=1.2)
+                        return True
+                    fresh = self._window.capture()
+                    if fresh is not None and (self.detect_state(fresh) == ScreenState.MAP or len(self.get_visible_cards(fresh)) >= 2):
+                        self.wait_for_list_stable(timeout=1.2)
+                        return True
+            else:
+                if len(self.get_visible_cards(frame)) >= 2:
+                    logger.info("already on map screen (detected card list)")
+                    self.wait_for_list_stable(timeout=1.2)
+                    return True
+
+            time.sleep(0.1)
+
+        # Final check if transitioned at deadline
+        final_frame = self._window.capture()
+        if final_frame is not None and (self.detect_state(final_frame) == ScreenState.MAP or len(self.get_visible_cards(final_frame)) >= 2):
+            self.wait_for_list_stable(timeout=1.2)
             return True
 
-        if self._map_btn_tmpl is None:
-            logger.error("MAP button template not available")
-            return False
+        logger.warning("failed to open map within %.1fs timeout", timeout)
+        return False
 
-        # Dynamic match (global scan first, dynamic ROI once memorized)
-        match_res = self._roi_map_btn.match(frame, self._map_btn_tmpl, threshold=0.65)
-        if match_res is None:
-            # Double check if screen is already on map
-            if len(self.get_visible_cards(frame)) >= 2:
-                logger.info("already on map screen (detected card list)")
+    def close_map(self, timeout: float = 4.0) -> bool:
+        """Close map interface using the detected CLOSE or BACK button with active retry."""
+        deadline = time.monotonic() + timeout
+        last_click_time = 0.0
+
+        while time.monotonic() < deadline:
+            frame = self._window.capture()
+            if frame is None:
+                time.sleep(0.1)
+                continue
+
+            if self.detect_state(frame) == ScreenState.ISLAND:
                 return True
-            logger.warning("MAP button not detected on island view")
-            return False
 
-        click_x, click_y = match_res.center
-        logger.info("clicking detected MAP button at (%d, %d)", click_x, click_y)
-        self._action.click(click_x, click_y)
+            scales = self._get_scale_steps(frame)
+            match = self._roi_close_btn.match_any(
+                frame,
+                [("close", self._close_btn_tmpl), ("back", self._back_btn_tmpl)],
+                threshold=0.55,
+                scales=scales,
+            )
+            now = time.monotonic()
+            if match is not None:
+                btn_name, match_res = match
+                click_x, click_y = match_res.center
+                if now - last_click_time >= 0.5:
+                    logger.info("clicking detected %s button at (%d, %d)", btn_name.upper(), click_x, click_y)
+                    self._action.click(click_x, click_y)
+                    last_click_time = now
+                    if self.wait_for_state(ScreenState.ISLAND, timeout=2.0):
+                        return True
+            time.sleep(0.1)
 
-        # Wait for map screen to load and list to settle
-        ok = self.wait_for_state(ScreenState.MAP, timeout=self._cfg.map.map_timeout)
-        if not ok:
-            fresh = self._window.capture()
-            if fresh is not None and len(self.get_visible_cards(fresh)) >= 2:
-                ok = True
-        if ok:
-            self.wait_for_list_stable(timeout=1.2)
-        return ok
-
-    def close_map(self) -> bool:
-        """Close map interface using the detected CLOSE or BACK button."""
-        frame = self._window.capture()
-        if frame is None:
-            return False
-
-        match = self._roi_close_btn.match_any(
-            frame,
-            [("close", self._close_btn_tmpl), ("back", self._back_btn_tmpl)],
-            threshold=0.62,
-        )
-        if match is None:
-            logger.warning("neither CLOSE nor BACK button detected to exit map")
-            return False
-
-        btn_name, match_res = match
-        click_x, click_y = match_res.center
-        logger.info("clicking detected %s button at (%d, %d)", btn_name.upper(), click_x, click_y)
-        self._action.click(click_x, click_y)
-        return self.wait_for_state(ScreenState.ISLAND, timeout=self._cfg.map.map_timeout)
+        final_frame = self._window.capture()
+        if final_frame is not None and self.detect_state(final_frame) == ScreenState.ISLAND:
+            return True
+        return False
 
     # ----------------------------------------------------- Island Card Scanning
 
@@ -382,12 +451,14 @@ class MapNavigator:
 
                 now = time.monotonic()
 
+                scales = self._get_scale_steps(frame)
+
                 # 2. Check 'You are here!' button via DynamicROI with multi-template matching
                 here_templates = [
                     ("clean", self._here_clean_tmpl),
                     ("faded", self._here_btn_tmpl),
                 ]
-                here_match = self._roi_here.match_any(frame, here_templates, threshold=0.55)
+                here_match = self._roi_here.match_any(frame, here_templates, threshold=0.52, scales=scales)
                 if here_match is not None:
                     _, here_res = here_match
                     cx, cy = here_res.center
@@ -406,7 +477,7 @@ class MapNavigator:
                             return True
 
                 # 3. Check GO button via DynamicROI with multi-template matching (threshold relaxed to 0.48)
-                go_match = self._roi_go.match_any(frame, go_templates, threshold=0.48)
+                go_match = self._roi_go.match_any(frame, go_templates, threshold=0.48, scales=scales)
                 if go_match is not None:
                     _, go_res = go_match
                     cx, cy = go_res.center
@@ -434,17 +505,20 @@ class MapNavigator:
 
     def wait_for_list_stable(
         self,
-        timeout: float = 1.5,
-        poll_interval: float = 0.06,
-        motion_threshold: float = 2.0,
+        timeout: float = 1.8,
+        poll_interval: float = 0.05,
+        motion_threshold: float = 2.5,
+        consecutive_required: int = 2,
     ) -> bool:
-        """Wait dynamically until the left island list stops moving (momentum/bounce settles).
+        """Wait dynamically until the left island list decelerates to stationary.
 
         Captures consecutive frames and computes pixel difference in the list region.
-        Returns True when motion drops below threshold, or False if timeout expires.
+        Requires `consecutive_required` consecutive samples below `motion_threshold`
+        to guarantee that deformation rebound has fully ended and list velocity is zero.
         """
         deadline = time.monotonic() + timeout
         last_crop = None
+        stable_count = 0
 
         while time.monotonic() < deadline:
             frame = self._window.capture()
@@ -462,8 +536,12 @@ class MapNavigator:
             if last_crop is not None and last_crop.shape == cur_crop.shape:
                 diff = float(np.mean(cv2.absdiff(cur_crop, last_crop)))
                 if diff < motion_threshold:
-                    logger.debug("island list has settled (motion diff=%.2f)", diff)
-                    return True
+                    stable_count += 1
+                    if stable_count >= consecutive_required:
+                        logger.debug("island list has settled to stationary (motion diff=%.2f, count=%d)", diff, stable_count)
+                        return True
+                else:
+                    stable_count = 0
 
             last_crop = cur_crop
             time.sleep(poll_interval)
@@ -500,8 +578,9 @@ class MapNavigator:
 
         Pure dynamic overscroll invariance:
         Exploits list physics: dragging downwards at top stretches/bounces the list,
-        but reveals no new cards. When the topmost card remains unchanged
-        after a swipe settles, stops immediately.
+        then rebounds back to its resting position and decelerates to stationary.
+        When the resting list region content remains identical to the content
+        before the swipe, initialization is complete.
         """
         w, h = self._window.client_size()
         if w <= 0 or h <= 0:
@@ -513,20 +592,33 @@ class MapNavigator:
         start_y = int(220 * sy)
         end_y = int(580 * sy)
 
-        # Quick check: already at top?
-        frame = self._window.capture()
-        last_top_hash = 0
-        last_top_y = 0
-        if frame is not None:
-            cards = self.get_visible_cards(frame)
-            if cards:
-                last_top_hash = cards[0].card_hash
-                last_top_y = cards[0].rect[1]
+        y1, y2 = int(80 * sy), int(680 * sy)
+        x1, x2 = int(50 * sx), int(330 * sx)
 
-        consecutive_same_top = 0
+        brake_mode = getattr(self._cfg.map, "init_brake_mode", "dynamic")
+        first_island_target = getattr(self._cfg.map, "first_island_name", "Plant Island").strip()
+
+        # Ensure list is completely stationary before recording pre-drag baseline
+        self.wait_for_list_stable(timeout=1.0)
+        pre_frame = self._window.capture()
+        last_settled_crop: Optional[np.ndarray] = None
+        last_cards: List[IslandCardInfo] = []
+
+        if pre_frame is not None:
+            cards = self.get_visible_cards(pre_frame)
+            if cards:
+                if brake_mode == "first_island" and first_island_target:
+                    top_name = cards[0].name.strip().lower()
+                    tgt_name = first_island_target.lower()
+                    if top_name == tgt_name or tgt_name in top_name or self._recognizer.is_blacklisted(cards[0].name, [first_island_target]):
+                        logger.info("already at specified first island '%s' at top", first_island_target)
+                        self._action.park_cursor()
+                        return True
+                last_cards = cards
+            last_settled_crop = pre_frame[y1:y2, x1:x2].copy()
 
         for swipe_idx in range(max_swipes):
-            logger.info("pulling list downwards to top (swipe %d/%d)", swipe_idx + 1, max_swipes)
+            logger.info("pulling list downwards to top (swipe %d/%d, mode=%s)", swipe_idx + 1, max_swipes, brake_mode)
             self._action.drag(
                 start_x=drag_x,
                 start_y=start_y,
@@ -535,30 +627,43 @@ class MapNavigator:
                 duration=self._cfg.map.drag_duration,
                 steps=self._cfg.map.drag_steps,
             )
-            self.wait_for_list_stable(timeout=1.2)
+
+            # 等待列表速度减速到完全静止（吸收形变与回弹阻尼）
+            self.wait_for_list_stable(timeout=1.8, motion_threshold=2.5, consecutive_required=2)
 
             frame = self._window.capture()
             if frame is None:
                 continue
 
+            curr_settled_crop = frame[y1:y2, x1:x2]
             cards = self.get_visible_cards(frame)
-            if not cards:
-                continue
 
-            top_card = cards[0]
-            is_same_hash = (top_card.card_hash != 0 and last_top_hash != 0 and hash_distance(top_card.card_hash, last_top_hash) <= 2)
-            is_same_pos = abs(top_card.rect[1] - last_top_y) <= 12
-
-            if is_same_hash and is_same_pos:
-                consecutive_same_top += 1
-                if consecutive_same_top >= 1:
-                    logger.info("list reached physical top ceiling after %d swipe(s), stopping", swipe_idx + 1)
+            # 1. 指定首岛模式判定
+            if brake_mode == "first_island" and first_island_target and cards:
+                top_name = cards[0].name.strip().lower()
+                tgt_name = first_island_target.lower()
+                if top_name == tgt_name or tgt_name in top_name or self._recognizer.is_blacklisted(cards[0].name, [first_island_target]):
+                    logger.info("reached specified first island '%s' at top after %d swipe(s), stopping", first_island_target, swipe_idx + 1)
                     break
-            else:
-                consecutive_same_top = 0
 
-            last_top_hash = top_card.card_hash
-            last_top_y = top_card.rect[1]
+            # 2. 物理过卷形变回弹一致性判定（适用于 dynamic 模式及作为通用收敛保障）
+            if last_settled_crop is not None and last_settled_crop.shape == curr_settled_crop.shape:
+                crop_diff = float(np.mean(cv2.absdiff(curr_settled_crop, last_settled_crop)))
+                cards_match = bool(
+                    cards and last_cards and
+                    cards[0].card_hash != 0 and last_cards[0].card_hash != 0 and
+                    hash_distance(cards[0].card_hash, last_cards[0].card_hash) <= 2 and
+                    abs(cards[0].rect[1] - last_cards[0].rect[1]) <= 10
+                )
+                if crop_diff < 4.0 or cards_match:
+                    logger.info(
+                        "列表上拉形变回弹并减速静止后，区域内容与前次完全一致（差异度 %.2f），物理置顶初始化完毕",
+                        crop_diff,
+                    )
+                    break
+
+            last_settled_crop = curr_settled_crop.copy()
+            last_cards = cards
 
         self._action.park_cursor()
         return True

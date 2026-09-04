@@ -295,3 +295,76 @@ def test_card_is_fully_visible_distinguishes_clipped_bottom_cards() -> None:
     # The 6th card (index 5) is partially clipped by the bottom border
     if len(cards) >= 6:
         assert cards[5].is_fully_visible is False
+
+
+def test_1080p_resolution_adaptation_and_open_map() -> None:
+    """Verify state detection and open_map function accurately under 1080p scaling."""
+    island_path = os.path.join(PROJECT_ROOT, "captures", "map", "map_20260902_185628_230.png")
+    map_path = os.path.join(PROJECT_ROOT, "captures", "map", "map_20260902_185615_714.png")
+    if not (os.path.isfile(island_path) and os.path.isfile(map_path)):
+        pytest.skip("Capture frames not found")
+
+    island_frame = cv2.resize(cv2.imread(island_path), (1920, 1080))
+    map_frame = cv2.resize(cv2.imread(map_path), (1920, 1080))
+
+    window = MockWindow(frame=island_frame)
+    window._client_size = (1920, 1080)
+    action = MockAction(window=window)
+    nav = MapNavigator(action_agent=action, window=window, config=DEFAULT_CONFIG)
+
+    # 1. 1080p Island frame should detect ScreenState.ISLAND
+    assert nav.detect_state(island_frame) == ScreenState.ISLAND
+
+    # 2. open_map on 1080p should detect the scaled MAP button and click it
+    # Mock transition to MAP on click
+    def fake_wait(state: ScreenState, timeout: float = 6.0) -> bool:
+        return True
+    nav.wait_for_state = fake_wait  # type: ignore
+
+    opened = nav.open_map(timeout=1.0)
+    assert opened is True
+    assert len(action.clicks) >= 1
+    click_x, click_y = action.clicks[0]
+    # Button center on 1080p is approx (935, 977)
+    assert 850 <= click_x <= 1000
+    assert 900 <= click_y <= 1050
+
+    # 3. 1080p Map frame should detect ScreenState.MAP directly
+    assert nav.detect_state(map_frame) == ScreenState.MAP
+
+
+def test_scroll_to_top_deceleration_and_stationary_comparison() -> None:
+    """Verify scroll_to_top continues when content changes, and stops when settled content is identical."""
+    mid_path = os.path.join(PROJECT_ROOT, "captures", "map", "map_20260902_185624_703.png")
+    top_path = os.path.join(PROJECT_ROOT, "captures", "map", "map_20260902_185615_714.png")
+    if not (os.path.isfile(mid_path) and os.path.isfile(top_path)):
+        pytest.skip("Capture frames not found")
+
+    mid_frame = cv2.imread(mid_path)
+    top_frame = cv2.imread(top_path)
+
+    # Frame sequence: starts at mid, swipe 1 transitions to top, swipe 2 remains at top
+    frames = [mid_frame, top_frame, top_frame]
+    current_idx = 0
+
+    class SequenceWindow(MockWindow):
+        def capture(self) -> Optional[np.ndarray]:
+            return frames[min(current_idx, len(frames) - 1)]
+
+    window = SequenceWindow()
+    action = MockAction(window=window)
+
+    def on_drag(start_x: int, start_y: int, end_x: int, end_y: int, duration: float = 0.25, steps: int = 10) -> bool:
+        nonlocal current_idx
+        action.drags.append((start_x, start_y, end_x, end_y))
+        current_idx += 1
+        return True
+
+    action.drag = on_drag  # type: ignore
+    nav = MapNavigator(action_agent=action, window=window, config=DEFAULT_CONFIG)
+
+    ok = nav.scroll_to_top(max_swipes=5)
+    assert ok is True
+    # Swipe 1: mid -> top (content changed -> continues)
+    # Swipe 2: top -> top (settled content identical -> stops)
+    assert len(action.drags) == 2

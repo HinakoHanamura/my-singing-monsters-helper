@@ -40,7 +40,8 @@ junit*.xml
 .agents/
 scratch/
 
-# Temporarily ignore all markdown documentation
-*.md
-**/*.md
+# User local settings persistence
+user_settings.json
+
+
 

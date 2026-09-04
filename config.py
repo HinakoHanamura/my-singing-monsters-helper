@@ -14,6 +14,7 @@ camera zoom and pan untouched. 24 frames across two recordings, 219 detections.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -455,6 +456,10 @@ class MapConfig:
     blacklist: List[str] = field(default_factory=list)
     # Character matching threshold for letter recognizer.
     letter_match_threshold: float = 0.80
+    # Initialization brake mode: 'dynamic' (physical ceiling invariance) or 'first_island'.
+    init_brake_mode: str = "dynamic"
+    # Target first island name when init_brake_mode == 'first_island' (default: Plant Island).
+    first_island_name: str = "Plant Island"
 
 
 @dataclass(frozen=True)
@@ -471,3 +476,26 @@ class AppConfig:
 
 
 DEFAULT_CONFIG = AppConfig()
+
+SETTINGS_FILE = _in_project("user_settings.json")
+
+
+def load_user_settings() -> dict:
+    """Load persistent user preferences from disk (language, blacklist, options)."""
+    if os.path.isfile(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_user_settings(settings: dict) -> None:
+    """Save persistent user preferences to disk."""
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+

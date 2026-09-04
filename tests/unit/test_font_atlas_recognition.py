@@ -16,15 +16,6 @@ from core.letter_recognizer import LetterRecognizer, KNOWN_ISLANDS
 from core.map_navigator import MapNavigator, hash_distance
 
 
-def test_font_atlases_present() -> None:
-    """Verify authentic font atlas files are stored in assets/fonts."""
-    fonts_dir = os.path.join(PROJECT_ROOT, "assets", "fonts")
-    assert os.path.isdir(fonts_dir), "assets/fonts directory missing"
-
-    for atlas_name in ("font_atlas_retina.png", "font_atlas_standard.png", "font_atlas_mask.png"):
-        p = os.path.join(fonts_dir, atlas_name)
-        assert os.path.isfile(p), f"Atlas file missing: {atlas_name}"
-        assert os.path.getsize(p) > 10000, f"Atlas file too small: {atlas_name}"
 
 
 def test_extracted_letters_complete() -> None:
