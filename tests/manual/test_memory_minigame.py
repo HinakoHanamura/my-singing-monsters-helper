@@ -14,7 +14,7 @@ threshold turning out to be unfixable in principle, and a patch of violet *insid
 revealed artwork that the detector accepted as a card back. None was reachable
 from the recordings.
 
-Note that the UI can now run the minigame too (the "记忆小游戏" button). This
+Note that the UI can now run the minigame too (the "Memory Minigame" button). This
 script remains the diagnostic route: observe mode prints the per-slot numbers
 behind every gate the runner applies, which the UI deliberately does not.
 
@@ -31,7 +31,7 @@ reachable -- see the module docstring of ``core/minigames/memory_runner.py``.
 
 Comparing the two flip orders
 -----------------------------
-``--scan-first`` selects the same order the UI's "加速配对" checkbox does: turn
+``--scan-first`` selects the same order the UI's "Fast Match" checkbox does: turn
 every card over before collecting anything. It costs at most one more miss than
 the default and both fit the game's allowance, so which one is *faster* is a
 measurement rather than an argument. Run each order once and compare the per-level
@@ -153,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="scan_first",
         help=(
             "turn every card over before collecting any pair, the same order as "
-            "the UI's 加速配对 checkbox. One more miss at worst; run both and "
+            "the UI's Fast Match checkbox. One more miss at worst; run both and "
             "compare the per-level seconds."
         ),
     )

@@ -110,32 +110,18 @@ def test_card_hist_separation_across_different_islands() -> None:
 def test_distinct_known_islands_are_not_falsely_marked_visited() -> None:
     """Verify that Air Island, Water Island, and Earth Island are not falsely considered
     visited when Plant Island and Cold Island are already in visited_names."""
-    import difflib
-
-    def strip_island_suffix(name: str) -> str:
-        s = name.strip().lower()
-        for suffix in (" island", " lsland", " lslond", " lsiond", " iuland", " islaou", " lula", " lzfund"):
-            if s.endswith(suffix):
-                s = s[: -len(suffix)].strip()
-        return s
+    from core.letter_recognizer import LetterRecognizer
 
     visited_names = {"plant island", "cold island"}
 
     for candidate in ["Air Island", "Water Island", "Earth Island", "Shugabush Island", "Fire Haven"]:
         clean = candidate.strip().lower()
-        is_known = any(k.lower() == clean for k in KNOWN_ISLANDS)
 
         # 1. Exact
         exact = clean in visited_names
-        # 2. Fuzzy only if not known
-        fuzzy = False
-        if not is_known:
-            dist = strip_island_suffix(clean)
-            for v in visited_names:
-                v_dist = strip_island_suffix(v)
-                if difflib.SequenceMatcher(None, dist, v_dist).ratio() >= 0.70:
-                    fuzzy = True
-                    break
+        # 2. Fuzzy match against visited names
+        fuzzy = any(LetterRecognizer.names_fuzzy_match(clean, v) for v in visited_names)
 
         assert not exact, f"{candidate} had false exact match"
         assert not fuzzy, f"{candidate} had false fuzzy match"
+

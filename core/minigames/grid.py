@@ -132,7 +132,7 @@ def reading_order(
 def describe_grid(
     boxes: Sequence[PixelRect], row_tolerance: float | None = None
 ) -> str:
-    """Human-readable shape summary, e.g. ``"3 行 (4/4/2)，共 10 张"``.
+    """Human-readable shape summary, e.g. ``"3 rows (4/4/2), total 10 cards"``.
 
     Used in the log so a wrong row split is obvious at a glance: a board that
     should read 4/4 showing up as 2/2/2/2 is a tolerance problem, and seeing it

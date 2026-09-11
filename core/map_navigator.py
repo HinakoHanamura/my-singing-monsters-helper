@@ -19,7 +19,7 @@ from config import (
 from core.action_agent import ActionAgent
 from core.adaptive_roi import DynamicROI, MatchResult
 from core.game_window import GameWindow
-from core.letter_recognizer import LetterRecognizer
+from core.letter_recognizer import LetterRecognizer, get_shared_ocr_engine
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,7 @@ class MapNavigator:
         self._here_clean_tmpl = cv2.imread(f"{template_dir}/map_you_are_here_clean.png")
         self._close_btn_tmpl = cv2.imread(f"{template_dir}/map_close_button.png")
         self._back_btn_tmpl = cv2.imread(f"{template_dir}/map_back_button.png")
+        self._card_rail_tmpl = cv2.imread(f"{template_dir}/map_card_rail.png")
 
         # Dynamic ROI trackers (default: no ROI -> global scan fallback)
         self._roi_go = DynamicROI("map_go", margin_x=80, margin_y=80)
@@ -124,7 +125,7 @@ class MapNavigator:
             return (1.0,)
         h, w = frame.shape[:2]
         base_s = h / 768.0
-        return (base_s * 0.94, base_s * 0.97, base_s, base_s * 1.03, base_s * 1.06)
+        return (base_s * 0.90, base_s * 0.95, base_s, base_s * 1.05, base_s * 1.10)
 
     # -------------------------------------------------------- State Detection
 
@@ -138,27 +139,61 @@ class MapNavigator:
             return ScreenState.UNKNOWN
 
         h, w = frame.shape[:2]
+        ui_scale = h / 768.0
+
+        # 1. Fast loading check (< 0.1ms): dark iris transition or low-variance frame
+        corner_margin = max(10, int(40 * ui_scale))
+        top_left_dark = float(frame[:corner_margin, :corner_margin].mean()) < 35.0
+        top_right_dark = float(frame[:corner_margin, -corner_margin:].mean()) < 35.0
+        if (top_left_dark and top_right_dark) or float(frame.std()) < 18.0 or float(frame.mean()) < 25.0:
+            return ScreenState.LOADING
+
         scales = self._get_scale_steps(frame)
 
-        # 1. Check for Island view: MAP button on bottom toolbar
-        if self._map_btn_tmpl is not None:
-            map_search_roi = (int(h * 0.65), h, 0, w)
-            map_res = self._roi_map_btn.match(
-                frame, self._map_btn_tmpl, threshold=0.60, scales=scales, search_roi=map_search_roi
-            )
-            if map_res is not None:
-                return ScreenState.ISLAND
+        # 2. Fast structural check for Map view: presence of vertical island card rail grooves (< 8ms)
+        if self._card_rail_tmpl is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            th_tmpl = cv2.cvtColor(self._card_rail_tmpl, cv2.COLOR_BGR2GRAY)
+            tw = max(10, int(th_tmpl.shape[1] * ui_scale))
+            th = max(4, int(th_tmpl.shape[0] * ui_scale))
+            if tw < w and th < h:
+                scaled_tmpl = cv2.resize(th_tmpl, (tw, th))
+                res = cv2.matchTemplate(gray, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
+                row_max = res.max(axis=1)
+                peaks = [
+                    y
+                    for y in range(1, len(row_max) - 1)
+                    if row_max[y] >= 0.65 and row_max[y] >= row_max[y - 1] and row_max[y] >= row_max[y + 1]
+                ]
+                filtered = []
+                for p in peaks:
+                    if not any(abs(p - f) < int(35 * ui_scale) for f in filtered):
+                        filtered.append(p)
+                min_card_h = int(75 * ui_scale)
+                max_card_h = int(150 * ui_scale)
+                spacings = [
+                    filtered[i + 1] - filtered[i]
+                    for i in range(len(filtered) - 1)
+                    if min_card_h <= filtered[i + 1] - filtered[i] <= max_card_h
+                ]
+                if len(spacings) >= 2:
+                    return ScreenState.MAP
 
-        # 2. Check for Map view: CLOSE button on bottom toolbar or top right, or BACK button
-        if self._close_btn_tmpl is not None:
-            close_search_roi = (int(h * 0.60), h, int(w * 0.60), w)
-            close_res = self._roi_close_btn.match(
-                frame, self._close_btn_tmpl, threshold=0.58, scales=scales, search_roi=close_search_roi
-            )
-            if close_res is None:
-                close_res = self._roi_close_btn.match(
-                    frame, self._close_btn_tmpl, threshold=0.58, scales=scales
+        # 3. Check for Map view: GO button, CLOSE button, or BACK button (full-frame match)
+        if self._go_clean_tmpl is not None or self._go_btn_tmpl is not None:
+            go_tmpls = [("clean", self._go_clean_tmpl), ("plant", self._go_btn_tmpl)]
+            valid_go = [(name, t) for name, t in go_tmpls if t is not None]
+            if valid_go:
+                go_res = self._roi_go.match_any(
+                    frame, valid_go, threshold=0.55, scales=scales
                 )
+                if go_res is not None:
+                    return ScreenState.MAP
+
+        if self._close_btn_tmpl is not None:
+            close_res = self._roi_close_btn.match(
+                frame, self._close_btn_tmpl, threshold=0.58, scales=scales
+            )
             if close_res is not None:
                 return ScreenState.MAP
 
@@ -169,17 +204,29 @@ class MapNavigator:
             if back_res is not None:
                 return ScreenState.MAP
 
-        # Secondary structural check for Map view: presence of vertical island card list
-        cards = self.get_visible_cards(frame)
-        if len(cards) >= 2:
-            return ScreenState.MAP
+        # 4. Check for Island view: MAP button on screen (full-frame match)
+        if self._map_btn_tmpl is not None:
+            map_res = self._roi_map_btn.match(
+                frame, self._map_btn_tmpl, threshold=0.65, scales=scales
+            )
+            if map_res is not None:
+                return ScreenState.ISLAND
 
-        # 3. Neither interface button detected: check if screen is in dark iris transition (loading)
-        corner_margin = max(10, int(40 * (h / 768.0)))
-        top_left_dark = float(frame[:corner_margin, :corner_margin].mean()) < 30.0
-        top_right_dark = float(frame[:corner_margin, -corner_margin:].mean()) < 30.0
-        if top_left_dark and top_right_dark:
-            return ScreenState.LOADING
+        # 5. High-reliability OCR fallback on screen (only when visual matching is ambiguous)
+        ocr = get_shared_ocr_engine()
+        if ocr is not None:
+            try:
+                rec_res, _ = ocr(frame)
+                if rec_res:
+                    for box, text, score in rec_res:
+                        clean_t = text.strip().upper()
+                        if score >= 0.70:
+                            if clean_t in ("MAP", "COLLECT ALL", "COLLECTALL", "MARKET", "MAILBOX"):
+                                return ScreenState.ISLAND
+                            if clean_t in ("CLOSE", "MIRROR"):
+                                return ScreenState.MAP
+            except Exception:
+                pass
 
         return ScreenState.UNKNOWN
 
@@ -187,7 +234,7 @@ class MapNavigator:
         self,
         target_state: ScreenState,
         timeout: float = 8.0,
-        step_sleep: float = 0.35,
+        step_sleep: float = 0.04,
     ) -> bool:
         """Poll the window frame until target_state is reached or timeout expires."""
         deadline = time.monotonic() + timeout
@@ -217,8 +264,9 @@ class MapNavigator:
                 time.sleep(0.1)
                 continue
 
-            # Fast check: already on map screen?
-            if self.detect_state(frame) == ScreenState.MAP or len(self.get_visible_cards(frame)) >= 2:
+            # State check: already on map screen? (Only valid if state is MAP)
+            cur_state = self.detect_state(frame)
+            if cur_state == ScreenState.MAP and len(self.get_visible_cards(frame)) >= 2:
                 logger.info("map screen confirmed active")
                 self.wait_for_list_stable(timeout=1.2)
                 return True
@@ -227,16 +275,34 @@ class MapNavigator:
                 logger.error("MAP button template not available")
                 return False
 
-            h, w = frame.shape[:2]
             scales = self._get_scale_steps(frame)
-            search_roi = (int(h * 0.65), h, 0, w)
             match_res = self._roi_map_btn.match(
-                frame, self._map_btn_tmpl, threshold=0.58, scales=scales, search_roi=search_roi
+                frame, self._map_btn_tmpl, threshold=0.55, scales=scales
             )
+
+            # OCR fallback for MAP button on full frame
             if match_res is None:
-                match_res = self._roi_map_btn.match(
-                    frame, self._map_btn_tmpl, threshold=0.58, scales=scales
-                )
+                ocr = get_shared_ocr_engine()
+                if ocr is not None:
+                    try:
+                        rec_res, _ = ocr(frame)
+                        if rec_res:
+                            for box, text, score in rec_res:
+                                if text.strip().upper() == "MAP" and score >= 0.70:
+                                    bx1 = min(pt[0] for pt in box)
+                                    bx2 = max(pt[0] for pt in box)
+                                    by1 = min(pt[1] for pt in box)
+                                    by2 = max(pt[1] for pt in box)
+                                    btn_cx = int((bx1 + bx2) / 2)
+                                    btn_cy = int(by1 - (by2 - by1) * 1.2)
+                                    match_res = MatchResult(
+                                        center=(btn_cx, btn_cy),
+                                        rect=(int(bx1), btn_cy - 30, int(bx2), int(by2)),
+                                        score=float(score),
+                                    )
+                                    break
+                    except Exception:
+                        pass
 
             now = time.monotonic()
             if match_res is not None:
@@ -247,16 +313,16 @@ class MapNavigator:
                     last_click_time = now
 
                     # Wait for map screen to load and list to settle
-                    if self.wait_for_state(ScreenState.MAP, timeout=2.5):
+                    if self.wait_for_state(ScreenState.MAP, timeout=3.0):
                         self.wait_for_list_stable(timeout=1.2)
                         return True
                     fresh = self._window.capture()
-                    if fresh is not None and (self.detect_state(fresh) == ScreenState.MAP or len(self.get_visible_cards(fresh)) >= 2):
+                    if fresh is not None and self.detect_state(fresh) == ScreenState.MAP:
                         self.wait_for_list_stable(timeout=1.2)
                         return True
             else:
-                if len(self.get_visible_cards(frame)) >= 2:
-                    logger.info("already on map screen (detected card list)")
+                if self.detect_state(frame) == ScreenState.MAP:
+                    logger.info("already on map screen")
                     self.wait_for_list_stable(timeout=1.2)
                     return True
 
@@ -264,7 +330,7 @@ class MapNavigator:
 
         # Final check if transitioned at deadline
         final_frame = self._window.capture()
-        if final_frame is not None and (self.detect_state(final_frame) == ScreenState.MAP or len(self.get_visible_cards(final_frame)) >= 2):
+        if final_frame is not None and self.detect_state(final_frame) == ScreenState.MAP:
             self.wait_for_list_stable(timeout=1.2)
             return True
 
@@ -282,24 +348,32 @@ class MapNavigator:
                 time.sleep(0.1)
                 continue
 
+            # Fast check: already left map view?
             if self.detect_state(frame) == ScreenState.ISLAND:
                 return True
 
             scales = self._get_scale_steps(frame)
-            match = self._roi_close_btn.match_any(
-                frame,
-                [("close", self._close_btn_tmpl), ("back", self._back_btn_tmpl)],
-                threshold=0.55,
-                scales=scales,
-            )
+            close_match = None
+            if self._close_btn_tmpl is not None:
+                close_match = self._roi_close_btn.match(
+                    frame, self._close_btn_tmpl, threshold=0.55, scales=scales
+                )
+
+            back_match = None
+            if close_match is None and self._back_btn_tmpl is not None:
+                back_match = self._roi_close_btn.match(
+                    frame, self._back_btn_tmpl, threshold=0.85, scales=scales
+                )
+
+            target_btn = close_match or back_match
             now = time.monotonic()
-            if match is not None:
-                btn_name, match_res = match
-                click_x, click_y = match_res.center
+            if target_btn is not None:
+                cx, cy = target_btn.center
                 if now - last_click_time >= 0.5:
-                    logger.info("clicking detected %s button at (%d, %d)", btn_name.upper(), click_x, click_y)
-                    self._action.click(click_x, click_y)
+                    logger.info("clicking map close/back button at (%d, %d)", cx, cy)
+                    self._action.click(cx, cy)
                     last_click_time = now
+
                     if self.wait_for_state(ScreenState.ISLAND, timeout=2.0):
                         return True
             time.sleep(0.1)
@@ -317,50 +391,59 @@ class MapNavigator:
             return []
 
         h, w = frame.shape[:2]
-        sx = w / 1024.0
-        sy = h / 768.0
+        ui_scale = h / 768.0
+        card_w = max(int(w * 0.36), int(360 * ui_scale))
+        center_x = int(card_w / 2)
 
-        # Left list boundaries
-        list_y1 = int(70 * sy)
-        list_y2 = int(700 * sy)
-        list_x1 = int(100 * sx)
-        list_x2 = int(250 * sx)
-
-        list_region = frame[list_y1:list_y2, list_x1:list_x2]
-        if list_region.size == 0:
-            return []
-
-        # Find separator grooves (dark copper bar grooves)
-        dark = (list_region < 45).all(axis=2)
-        frac = dark.mean(axis=1)
-
+        # 1. Dynamically lock card positions using the card frame rail template across full frame
         grooves: List[int] = []
-        in_groove = False
-        g_start = 0
-        for y, v in enumerate(frac):
-            if v > 0.75:
-                if not in_groove:
-                    in_groove = True
-                    g_start = y
-            else:
-                if in_groove:
-                    in_groove = False
-                    grooves.append(list_y1 + (g_start + y) // 2)
+        if self._card_rail_tmpl is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            th_tmpl = cv2.cvtColor(self._card_rail_tmpl, cv2.COLOR_BGR2GRAY)
+            best_peaks: List[Tuple[int, float]] = []
+            for s in (ui_scale * 0.95, ui_scale, ui_scale * 1.05):
+                tw = max(10, int(th_tmpl.shape[1] * s))
+                th = max(4, int(th_tmpl.shape[0] * s))
+                if tw >= w or th >= h:
+                    continue
+                scaled_tmpl = cv2.resize(th_tmpl, (tw, th))
+                res = cv2.matchTemplate(gray, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
+                row_max = res.max(axis=1)
+                peaks: List[Tuple[int, float]] = []
+                for y in range(1, len(row_max) - 1):
+                    if row_max[y] >= 0.65 and row_max[y] >= row_max[y - 1] and row_max[y] >= row_max[y + 1]:
+                        peaks.append((y, float(row_max[y])))
+                filtered: List[Tuple[int, float]] = []
+                for p in peaks:
+                    if not any(abs(p[0] - f[0]) < int(35 * ui_scale) for f in filtered):
+                        filtered.append(p)
+                filtered.sort(key=lambda p: p[0])
+                if len(filtered) > len(best_peaks):
+                    best_peaks = filtered
+            grooves = [p[0] for p in best_peaks]
 
-        cards: List[IslandCardInfo] = []
-        card_w = int(360 * sx)
-        min_card_h = int(80 * sy)
-        max_card_h = int(140 * sy)
-        # Compute dynamic card height from distance between consecutive detected grooves
+        min_card_h = int(75 * ui_scale)
+        max_card_h = int(150 * ui_scale)
         detected_spacings = [
             grooves[i + 1] - grooves[i]
             for i in range(len(grooves) - 1)
             if min_card_h <= (grooves[i + 1] - grooves[i]) <= max_card_h
         ]
-        nominal_h = int(np.median(detected_spacings)) if detected_spacings else int(109 * sy)
+        nominal_h = int(np.median(detected_spacings)) if detected_spacings else int(109 * ui_scale)
 
-        # 1. Intermediate cards between detected grooves
-        intermediate_cards: List[Tuple[int, int, str]] = []
+        cards_tuples: List[Tuple[int, int, str]] = []
+
+        # Card above the first detected groove (e.g. Plant Island at top)
+        if grooves:
+            first_cy1 = grooves[0]
+            if first_cy1 >= min_card_h:
+                top_cy1 = max(0, first_cy1 - nominal_h)
+                card_crop = frame[top_cy1:first_cy1, 0:card_w]
+                name = self._recognizer.recognize_card(card_crop)
+                if name:
+                    cards_tuples.append((top_cy1, first_cy1, name))
+
+        # Intermediate cards between detected grooves
         for i in range(len(grooves) - 1):
             cy1 = grooves[i]
             cy2 = grooves[i + 1]
@@ -368,37 +451,22 @@ class MapNavigator:
             if min_card_h <= ch <= max_card_h:
                 card_crop = frame[cy1:cy2, 0:card_w]
                 name = self._recognizer.recognize_card(card_crop)
-                intermediate_cards.append((cy1, cy2, name))
-
-        cards_tuples: List[Tuple[int, int, str]] = []
-
-        # 2. Check if a card exists above the first detected groove (e.g. Plant Island at top)
-        if intermediate_cards:
-            first_cy1 = intermediate_cards[0][0]
-            if first_cy1 - list_y1 >= min_card_h:
-                top_cy1 = max(list_y1, first_cy1 - int(109 * sy))
-                card_crop = frame[top_cy1:first_cy1, 0:card_w]
-                name = self._recognizer.recognize_card(card_crop)
                 if name:
-                    cards_tuples.append((top_cy1, first_cy1, name))
+                    cards_tuples.append((cy1, cy2, name))
 
-        cards_tuples.extend(intermediate_cards)
-
-        # 3. Check if a card exists below the last detected groove
-        if intermediate_cards:
-            last_cy2 = intermediate_cards[-1][1]
-            if list_y2 - last_cy2 >= min_card_h:
-                bot_cy2 = min(list_y2, last_cy2 + nominal_h)
+        # Card below the last detected groove
+        if grooves:
+            last_cy2 = grooves[-1]
+            if h - last_cy2 >= min_card_h:
+                bot_cy2 = min(h, last_cy2 + nominal_h)
                 card_crop = frame[last_cy2:bot_cy2, 0:card_w]
                 name = self._recognizer.recognize_card(card_crop)
                 if name:
                     cards_tuples.append((last_cy2, bot_cy2, name))
 
         cards: List[IslandCardInfo] = []
-        center_x = int(180 * sx)
         for idx, (cy1, cy2, name) in enumerate(cards_tuples):
-            # Dynamically evaluate if the card is fully visible and not clipped by viewport edges
-            is_full = (cy2 <= list_y2 - int(15 * sy)) and (cy2 - cy1 >= int(75 * sy))
+            is_full = (cy2 <= int(680 * ui_scale)) and (cy2 - cy1 >= int(nominal_h * 0.92))
             card_crop = frame[cy1:cy2, 0:card_w]
             chash = compute_card_hash(card_crop)
             chist = compute_card_hist(card_crop)
@@ -424,64 +492,104 @@ class MapNavigator:
         logger.info("selecting island card '%s' at (%d, %d)", card.name, cx, cy)
         return self._action.click(cx, cy)
 
-    def enter_selected_island(self, timeout: float = 6.0) -> bool:
-        """Wait for screen transition and click detected 'GO' or 'Here' button.
+    def wait_for_panel_stable(
+        self,
+        timeout: float = 0.5,
+        poll_interval: float = 0.02,
+        motion_threshold: float = 4.0,
+        consecutive_required: int = 2,
+    ) -> bool:
+        """Wait dynamically until the right-hand island preview panel stabilizes.
 
-        Active retry mechanism: periodically retries clicking if the game drops
-        the click during UI animation, preventing missed transitions.
+        Prevents false-starts where a previous island's preview or button
+        is clicked before the new island's panel finishes animating in.
         """
         deadline = time.monotonic() + timeout
-        step_sleep = 0.04  # 40ms polling for responsive detection
+        last_crop = None
+        stable_count = 0
+
+        while time.monotonic() < deadline:
+            frame = self._window.capture()
+            if frame is None:
+                time.sleep(poll_interval)
+                continue
+
+            h, w = frame.shape[:2]
+            y1, y2 = int(h * 0.10), int(h * 0.70)
+            x1, x2 = int(w * 0.40), int(w * 0.90)
+            cur_crop = frame[y1:y2, x1:x2]
+
+            if last_crop is not None and last_crop.shape == cur_crop.shape:
+                diff = float(np.mean(cv2.absdiff(cur_crop, last_crop)))
+                if diff < motion_threshold:
+                    stable_count += 1
+                    if stable_count >= consecutive_required:
+                        logger.debug("island preview panel has settled (diff=%.2f, count=%d)", diff, stable_count)
+                        return True
+                else:
+                    stable_count = 0
+
+            last_crop = cur_crop
+            time.sleep(poll_interval)
+
+        return False
+
+    def enter_selected_island(
+        self,
+        timeout: float = 8.0,
+        target_card: Optional[IslandCardInfo] = None,
+    ) -> bool:
+        """Wait for screen transition and click detected 'GO' or 'Here' button.
+
+        Includes anti-race guards:
+        1. Dynamically waits for the right panel to settle when target_card is provided,
+           preventing clicking an old island's GO button.
+        2. Rapid matching with fast cadence (~20ms).
+        3. Active retry mechanism if click was dropped by game (re-click after 350ms).
+        4. Positive island confirmation to prevent premature action in island view.
+        """
+        if target_card is not None:
+            self.wait_for_panel_stable(timeout=0.8, poll_interval=0.01)
+
+        deadline = time.monotonic() + timeout
+        step_sleep = 0.02
         last_click_time = 0.0
+        clicked_transition = False
 
         go_templates = [
             ("clean", self._go_clean_tmpl),
             ("plant", self._go_btn_tmpl),
         ]
+        here_templates = [
+            ("clean", self._here_clean_tmpl),
+            ("faded", self._here_btn_tmpl),
+        ]
 
         while time.monotonic() < deadline:
             frame = self._window.capture()
             if frame is not None:
-                # 1. If screen is already transitioning into loading or island view, wait for completion
+                h, w = frame.shape[:2]
                 state = self.detect_state(frame)
-                if state in (ScreenState.LOADING, ScreenState.ISLAND):
-                    return self.wait_for_state(
-                        ScreenState.ISLAND, timeout=self._cfg.map.map_timeout
-                    )
+
+                # 1. Screen is already in island view -> entry succeeded!
+                if state == ScreenState.ISLAND:
+                    logger.info("screen confirmed in island view")
+                    return True
+
+                # 2. If screen transitioned into loading or left map after click, wait for island
+                if state == ScreenState.LOADING or (clicked_transition and state != ScreenState.MAP):
+                    if self.wait_for_state(ScreenState.ISLAND, timeout=self._cfg.map.map_timeout):
+                        return True
 
                 now = time.monotonic()
-
                 scales = self._get_scale_steps(frame)
 
-                # 2. Check 'You are here!' button via DynamicROI with multi-template matching
-                here_templates = [
-                    ("clean", self._here_clean_tmpl),
-                    ("faded", self._here_btn_tmpl),
-                ]
-                here_match = self._roi_here.match_any(frame, here_templates, threshold=0.52, scales=scales)
-                if here_match is not None:
-                    _, here_res = here_match
-                    cx, cy = here_res.center
-                    if now - last_click_time >= 0.4:
-                        logger.info(
-                            "detected 'You are here!' button (score=%.3f), clicking (%d, %d)",
-                            here_res.score,
-                            cx,
-                            cy,
-                        )
-                        self._action.click(cx, cy)
-                        last_click_time = now
-                        if self.wait_for_state(ScreenState.ISLAND, timeout=1.5):
-                            return True
-                        if self.close_map():
-                            return True
-
-                # 3. Check GO button via DynamicROI with multi-template matching (threshold relaxed to 0.48)
-                go_match = self._roi_go.match_any(frame, go_templates, threshold=0.48, scales=scales)
+                # 3. Check GO button FIRST via DynamicROI across full frame
+                go_match = self._roi_go.match_any(frame, go_templates, threshold=0.45, scales=scales)
                 if go_match is not None:
                     _, go_res = go_match
                     cx, cy = go_res.center
-                    if now - last_click_time >= 0.4:
+                    if now - last_click_time >= 0.35:
                         logger.info(
                             "detected GO button (score=%.3f), clicking (%d, %d)",
                             go_res.score,
@@ -490,15 +598,44 @@ class MapNavigator:
                         )
                         self._action.click(cx, cy)
                         last_click_time = now
-                        if self.wait_for_state(ScreenState.ISLAND, timeout=1.5):
+                        clicked_transition = True
+                        if self.wait_for_state(ScreenState.ISLAND, timeout=self._cfg.map.map_timeout):
+                            return True
+
+                # 4. Check 'You are here!' button via DynamicROI across full frame
+                here_match = self._roi_here.match_any(frame, here_templates, threshold=0.50, scales=scales)
+                if here_match is not None:
+                    _, here_res = here_match
+                    cx, cy = here_res.center
+                    if now - last_click_time >= 0.35:
+                        logger.info(
+                            "detected 'You are here!' button (score=%.3f), clicking (%d, %d)",
+                            here_res.score,
+                            cx,
+                            cy,
+                        )
+                        self._action.click(cx, cy)
+                        last_click_time = now
+                        clicked_transition = True
+                        if self.wait_for_state(ScreenState.ISLAND, timeout=3.0):
+                            return True
+                        if self.close_map():
                             return True
 
             time.sleep(step_sleep)
 
         # Final check if screen transitioned at the end of timeout
         final_frame = self._window.capture()
-        if final_frame is not None and self.detect_state(final_frame) == ScreenState.ISLAND:
-            return True
+        if final_frame is not None:
+            if self.detect_state(final_frame) == ScreenState.ISLAND:
+                return True
+            if clicked_transition:
+                st = self.detect_state(final_frame)
+                if st != ScreenState.MAP:
+                    cards = self.get_visible_cards(final_frame)
+                    if len(cards) == 0:
+                        logger.info("transition completed (left map screen, cards cleared)")
+                        return True
 
         logger.warning("neither GO nor 'You are here!' entered successfully within timeout")
         return False
@@ -529,8 +666,9 @@ class MapNavigator:
             h, w = frame.shape[:2]
             sy = h / 768.0
             sx = w / 1024.0
+            ui_scale = min(sx, sy)
             y1, y2 = int(80 * sy), int(680 * sy)
-            x1, x2 = int(50 * sx), int(330 * sx)
+            x1, x2 = int(50 * ui_scale), int(330 * ui_scale)
             cur_crop = frame[y1:y2, x1:x2]
 
             if last_crop is not None and last_crop.shape == cur_crop.shape:
@@ -556,8 +694,9 @@ class MapNavigator:
             w, h = 1024, 768
         sx = w / 1024.0
         sy = h / 768.0
+        ui_scale = min(sx, sy)
 
-        drag_x = int(self._cfg.map.drag_x * sx)
+        drag_x = int(self._cfg.map.drag_x * ui_scale)
         start_y = int(self._cfg.map.drag_start_y * sy)
         end_y = int(self._cfg.map.drag_end_y * sy)
 
@@ -587,13 +726,14 @@ class MapNavigator:
             w, h = 1024, 768
         sx = w / 1024.0
         sy = h / 768.0
+        ui_scale = min(sx, sy)
 
-        drag_x = int(self._cfg.map.drag_x * sx)
+        drag_x = int(self._cfg.map.drag_x * ui_scale)
         start_y = int(220 * sy)
         end_y = int(580 * sy)
 
         y1, y2 = int(80 * sy), int(680 * sy)
-        x1, x2 = int(50 * sx), int(330 * sx)
+        x1, x2 = int(50 * ui_scale), int(330 * ui_scale)
 
         brake_mode = getattr(self._cfg.map, "init_brake_mode", "dynamic")
         first_island_target = getattr(self._cfg.map, "first_island_name", "Plant Island").strip()
@@ -628,7 +768,7 @@ class MapNavigator:
                 steps=self._cfg.map.drag_steps,
             )
 
-            # 等待列表速度减速到完全静止（吸收形变与回弹阻尼）
+            # Wait for list to decelerate to complete rest (absorb deformation and rebound damping)
             self.wait_for_list_stable(timeout=1.8, motion_threshold=2.5, consecutive_required=2)
 
             frame = self._window.capture()
@@ -638,7 +778,7 @@ class MapNavigator:
             curr_settled_crop = frame[y1:y2, x1:x2]
             cards = self.get_visible_cards(frame)
 
-            # 1. 指定首岛模式判定
+            # 1. Target first island check
             if brake_mode == "first_island" and first_island_target and cards:
                 top_name = cards[0].name.strip().lower()
                 tgt_name = first_island_target.lower()
@@ -646,7 +786,7 @@ class MapNavigator:
                     logger.info("reached specified first island '%s' at top after %d swipe(s), stopping", first_island_target, swipe_idx + 1)
                     break
 
-            # 2. 物理过卷形变回弹一致性判定（适用于 dynamic 模式及作为通用收敛保障）
+            # 2. Physical overscroll deformation and rebound consistency check
             if last_settled_crop is not None and last_settled_crop.shape == curr_settled_crop.shape:
                 crop_diff = float(np.mean(cv2.absdiff(curr_settled_crop, last_settled_crop)))
                 cards_match = bool(
@@ -712,8 +852,11 @@ class MapNavigator:
                     if on_located:
                         on_located(card.name)
                     self.select_island(card)
-                    entered = self.enter_selected_island()
+                    entered = self.enter_selected_island(target_card=card)
                     if entered:
+                        return True, "success"
+                    fresh_frame = self._window.capture()
+                    if fresh_frame is not None and self.detect_state(fresh_frame) == ScreenState.ISLAND:
                         return True, "success"
                     return False, "entry_timeout"
 

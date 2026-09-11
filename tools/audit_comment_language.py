@@ -50,7 +50,18 @@ ROOT = Path(__file__).resolve().parent.parent
 REPORT = ROOT / "reports" / "comment_language.txt"
 
 #: Directories that are not ours to police, plus generated trees.
-SKIP_DIRS = ("__pycache__", ".git", ".pytest_cache", "reports", "captures", ".agents")
+SKIP_DIRS = (
+    "__pycache__",
+    ".git",
+    ".pytest_cache",
+    "reports",
+    "captures",
+    ".agents",
+    "build",
+    "dist",
+    ".venv",
+    "venv",
+)
 
 STRING_PREFIXES = "rRbBuUfF"
 

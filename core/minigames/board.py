@@ -139,7 +139,7 @@ class SlotMap:
 
     @property
     def initial_shape(self) -> str:
-        """Row shape recorded at level start, e.g. ``"5 行 (6/6/6/6/6)，共 30 张"``.
+        """Row shape recorded at level start, e.g. ``"5 rows (6/6/6/6/6), total 30 cards"``.
 
         Logged once so a wrong row split is obvious at a glance instead of
         having to be inferred from odd clicking behaviour later.

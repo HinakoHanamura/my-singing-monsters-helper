@@ -108,7 +108,7 @@ from core.vision_agent import (
 )
 from collections import deque
 import cv2
-import difflib
+from core.letter_recognizer import LetterRecognizer
 from core.map_navigator import MapNavigator, ScreenState, IslandCardInfo, hash_distance
 
 logger = logging.getLogger(__name__)
@@ -119,7 +119,7 @@ class QueuedIsland:
     """Item in the monotonic FIFO tour queue."""
 
     name: str
-    canon_name: str
+    canon_name: str = ""
     card_hash: int = 0
     card_hist: Optional[np.ndarray] = None
 
@@ -771,27 +771,7 @@ class BotEngine(QThread):
         island_queue: deque[QueuedIsland] = deque()
         last_anchor: Optional[QueuedIsland] = None
 
-        def words_match(a: str, b: str) -> bool:
-            if a == b:
-                return True
-            if len(a) <= 4 and len(b) <= 4 and a[0] != b[0]:
-                return False
-            return difflib.SequenceMatcher(None, a, b).ratio() >= 0.70
-
-        def names_fuzzy_match(s1: str, s2: str) -> bool:
-            if not s1 or not s2:
-                return False
-            c1 = s1.strip().lower()
-            c2 = s2.strip().lower()
-            if c1 == c2:
-                return True
-            w1 = c1.split()
-            w2 = c2.split()
-            if len(w1) > 1 and len(w2) > 1:
-                if len(w1) != len(w2):
-                    return False
-                return all(words_match(a, b) for a, b in zip(w1, w2))
-            return words_match(c1, c2)
+        names_fuzzy_match = LetterRecognizer.names_fuzzy_match
 
         def match_card_to_island(card: IslandCardInfo, target: QueuedIsland) -> bool:
             # 1. Perceptual dHash match (visual identity - primary invariant)
@@ -858,7 +838,7 @@ class BotEngine(QThread):
                 # Guard against enqueuing partially clipped bottom boundary slivers
                 if not c.is_fully_visible:
                     continue
-                if not c.name or len(c.name.strip()) < 2:
+                if not c.name or not c.name.strip():
                     continue
                 if is_card_already_visited(c):
                     continue
@@ -917,6 +897,26 @@ class BotEngine(QThread):
             frame = self._timed("capture", self._window.capture)
             if frame is None:
                 break
+
+            cur_st = nav.detect_state(frame)
+            if cur_st == ScreenState.ISLAND:
+                self._emit_log(
+                    LogLevel.WARN,
+                    "【界面校准】 检测到当前画面在岛屿界面（MAP 按钮存在），正在打开地图界面…",
+                )
+                if not nav.open_map():
+                    self._emit_log(LogLevel.ERROR, "未能返回地图界面，巡岛中止")
+                    return
+                continue
+            elif cur_st != ScreenState.MAP:
+                self._emit_log(
+                    LogLevel.WARN,
+                    "【界面校准】 检测到当前画面未在地图界面（状态: %s），正在重新打开地图界面…" % cur_st.value,
+                )
+                if not nav.open_map():
+                    self._emit_log(LogLevel.ERROR, "未能返回地图界面，巡岛中止")
+                    return
+                continue
 
             cards = nav.get_visible_cards(frame)
             if not cards:
@@ -979,14 +979,20 @@ class BotEngine(QThread):
                 # Select target island card
                 self._emit_log(LogLevel.INFO, "【前往岛屿】 正在选中卡片 '%s'…" % target_disp_name)
                 nav.select_island(target_card)
-                self._sleep_timed(0.18)
 
                 self._emit_log(LogLevel.INFO, "【进入岛屿】 正在确认进入 '%s'…" % target_disp_name)
-                if not nav.enter_selected_island():
-                    self._emit_log(LogLevel.WARN, "未能进入岛屿 '%s'，跳过该岛屿" % target_disp_name)
-                    mark_card_visited(target_card)
-                    last_anchor = target
-                    continue
+                entered = nav.enter_selected_island(target_card=target_card)
+                if not entered:
+                    # Double check if screen actually entered island (state self-healing)
+                    fresh_frame = self._timed("capture", self._window.capture)
+                    if fresh_frame is not None and nav.detect_state(fresh_frame) == ScreenState.ISLAND:
+                        entered = True
+                        self._emit_log(LogLevel.INFO, "【状态自愈】 画面已确认进入岛屿 '%s'" % target_disp_name)
+                    else:
+                        self._emit_log(LogLevel.WARN, "未能进入岛屿 '%s'，跳过该岛屿" % target_disp_name)
+                        mark_card_visited(target_card)
+                        last_anchor = target
+                        continue
 
                 # Inside island: run full resource collection pipeline
                 self._emit_log(

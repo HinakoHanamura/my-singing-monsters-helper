@@ -43,5 +43,7 @@ scratch/
 # User local settings persistence
 user_settings.json
 
-
-
+# PyInstaller build outputs
+build/
+dist/
+*.spec

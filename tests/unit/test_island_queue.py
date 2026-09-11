@@ -21,20 +21,7 @@ def words_match(a: str, b: str) -> bool:
     return difflib.SequenceMatcher(None, a, b).ratio() >= 0.70
 
 
-def names_fuzzy_match(s1: str, s2: str) -> bool:
-    if not s1 or not s2:
-        return False
-    c1 = s1.strip().lower()
-    c2 = s2.strip().lower()
-    if c1 == c2:
-        return True
-    w1 = c1.split()
-    w2 = c2.split()
-    if len(w1) > 1 and len(w2) > 1:
-        if len(w1) != len(w2):
-            return False
-        return all(words_match(a, b) for a, b in zip(w1, w2))
-    return words_match(c1, c2)
+names_fuzzy_match = LetterRecognizer.names_fuzzy_match
 
 
 def match_card_to_island(card: IslandCardInfo, target: QueuedIsland) -> bool:
@@ -396,3 +383,28 @@ def test_unconditional_hash_deduplication_prevents_reentry() -> None:
 
     # Must be TRUE! Hash deduplication prevents re-entering the island!
     assert is_card_already_visited(card_noisy_ocr) is True
+
+
+def test_badge_suffix_matching_in_island_queue() -> None:
+    """Test Suite 8: Target queue matching works when card name has trailing badge noise."""
+    target_earth = QueuedIsland(name="Earth Island", card_hash=0)
+    card_earth_badge = IslandCardInfo(
+        index=0,
+        name="Earth Island A",
+        rect=(0, 100, 360, 200),
+        click_point=(180, 150),
+        card_hash=0,
+        is_fully_visible=True,
+    )
+    # Even with hash 0, fuzzy text matching must bridge "Earth Island" and "Earth Island A"
+    assert match_card_to_island(card_earth_badge, target_earth) is True
+
+
+def test_non_alphabetic_garbage_filtering() -> None:
+    """Test Suite 9: Non-alphabetic strings are filtered out from queue generation."""
+    garbage_samples = ["，。，", "。%", "---", "   "]
+    for sample in garbage_samples:
+        cleaned = LetterRecognizer.clean_title_tokens(sample)
+        assert cleaned == ""
+
+

@@ -156,33 +156,57 @@ class LetterRecognizer:
 
     @staticmethod
     def clean_title_tokens(text: str) -> str:
-        """Strip noise and trailing variations of 'island' to yield the core island name."""
-        words = text.strip().split()
-        if not words:
+        """Normalize title text into clean whitespace-delimited lowercase words."""
+        if not text:
             return ""
-        while words and len(words[-1]) == 1 and words[-1].lower() in "uwodhfqi":
-            words = words[:-1]
-        if not words:
-            return ""
-        last = words[-1].lower()
-        if (
-            difflib.SequenceMatcher(None, last, "island").ratio() >= 0.42
-            or difflib.SequenceMatcher(None, last, "ibioos").ratio() >= 0.60
-            or last.startswith("ib")
-            or last.startswith("is")
-            or last.startswith("ls")
-            or last.startswith("iu")
-            or last.startswith("lu")
-            or last in (
-                "island", "lsland", "lslond", "lsiond", "iuland", "islaou", "lula",
-                "lzfund", "lsianu", "lslaod", "lulonu", "ibloos", "ibfoos", "ibioos",
-                "ibioou", "ibioon", "ibloou", "ibious", "islood", "isiooj", "iblooj"
-            )
-        ):
-            words = words[:-1]
-        while words and len(words[-1]) == 1 and words[-1].lower() in "uwodhfqi":
-            words = words[:-1]
-        return text.strip().lower()
+        s = text.replace("\ufffd", "")
+        raw_words = s.strip().split()
+        words = [re.sub(r"^[^\w]+|[^\w]+$", "", w) for w in raw_words]
+        words = [w for w in words if w]
+        return " ".join(words).strip().lower()
+
+    @staticmethod
+    def words_match(a: str, b: str) -> bool:
+        """Compare two word tokens with 'l'/'1'/'i' interchangeability and prefix guarding."""
+        if a == b:
+            return True
+        na = a.replace("l", "i").replace("1", "i")
+        nb = b.replace("l", "i").replace("1", "i")
+        if na == nb:
+            return True
+        if abs(len(na) - len(nb)) >= 2 and min(len(na), len(nb)) <= 4:
+            return False
+        if len(na) <= 4 and len(nb) <= 4 and na[0] != nb[0]:
+            return False
+        return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.65
+
+    @classmethod
+    def names_fuzzy_match(cls, s1: str, s2: str) -> bool:
+        """Fuzzy match two island names, resilient to OCR typos and optional badge noise."""
+        if not s1 or not s2:
+            return False
+        c1 = cls.clean_title_tokens(s1)
+        c2 = cls.clean_title_tokens(s2)
+        if not c1 or not c2:
+            return False
+        if c1 == c2:
+            return True
+
+        w1 = c1.split()
+        w2 = c2.split()
+
+        # Direct token-by-token comparison
+        if len(w1) == len(w2) and len(w1) > 0:
+            return all(cls.words_match(a, b) for a, b in zip(w1, w2))
+
+        # If word counts differ due to an isolated single-char badge (e.g. 'A'), compare multi-char tokens
+        if len(w1) != len(w2):
+            w1_multi = [w for w in w1 if len(w) > 1]
+            w2_multi = [w for w in w2 if len(w) > 1]
+            if len(w1_multi) == len(w2_multi) and len(w1_multi) > 0:
+                return all(cls.words_match(a, b) for a, b in zip(w1_multi, w2_multi))
+
+        return False
 
     def resolve_canonical_name(
         self,
@@ -255,6 +279,115 @@ class LetterRecognizer:
     def _hash_dist(h1: int, h2: int) -> int:
         return bin((h1 ^ h2) & 0xFFFFFFFFFFFFFFFF).count("1")
 
+    @staticmethod
+    def extract_title_crop(card_bgr: np.ndarray) -> Optional[np.ndarray]:
+        """Extract the high-contrast 'black outline with white interior' title region from a card.
+
+        Isolates the title text by detecting white-fill connected components with dark
+        perimeters, groups them into horizontal text lines, selects strictly the top-most
+        line of text (ignoring the second line containing monster capacity counts like 42/69),
+        clusters horizontally to exclude isolated artwork/pins, and returns the cropped title.
+        """
+        if card_bgr is None or card_bgr.size == 0:
+            return None
+
+        h, w = card_bgr.shape[:2]
+        # Dynamically search the upper region where title and stats live
+        roi = card_bgr[0 : int(h * 0.55), 0 : w]
+        if roi.size == 0:
+            return None
+
+        rh, rw = roi.shape[:2]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # 1. White interior mask: High luminance (gray >= 170) and low saturation (sat <= 65)
+        white_mask = (gray >= 170) & (hsv[:, :, 1] <= 65)
+
+        # 2. Black outline detection: Letters have a distinct dark stroke (gray <= 90)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(white_mask.astype(np.uint8))
+
+        boxes = []
+        for lbl in range(1, num_labels):
+            bx, by, bw, bh, area = stats[lbl]
+            # Noise filter: area < 4 or height not matching font bounds
+            if area < 4 or bh < 5 or bh > int(rh * 0.90):
+                continue
+            # Filter non-letter geometry: allow vertical strokes (I, l) up to 8.0 and wide letters (W, M) up to 3.0
+            if bw / float(bh) > 3.0 or bh / float(bw) > 8.0:
+                continue
+            comp_m = (labels == lbl)
+            comp_dil = cv2.dilate(comp_m.astype(np.uint8), kernel, iterations=2)
+            outline = (comp_dil == 1) & (~comp_m)
+            dark_pixels = np.sum(outline & (gray <= 90))
+            # Black outline with white interior: at least 40% of the perimeter must be dark border
+            # (Real game font letters empirically have 72%-83% dark outline, while building highlights have <30%)
+            if dark_pixels / max(1, np.sum(outline)) >= 0.40:
+                boxes.append((bx, by, bw, bh, area))
+
+        if not boxes:
+            return roi
+
+        # 3. Group boxes into horizontal text lines (rows) based on vertical overlap
+        boxes.sort(key=lambda b: b[1])
+        lines: List[List[Tuple[int, int, int, int, int]]] = []
+        for b in boxes:
+            bx, by, bw, bh, area = b
+            placed = False
+            for line in lines:
+                line_y1 = min(box[1] for box in line)
+                line_y2 = max(box[1] + box[3] for box in line)
+                bc_y = by + bh / 2
+                lc_y = (line_y1 + line_y2) / 2
+                if abs(bc_y - lc_y) <= max(bh, 10) * 0.75:
+                    line.append(b)
+                    placed = True
+                    break
+            if not placed:
+                lines.append([b])
+
+        # Filter lines: only consider lines with at least 2 letter candidates
+        text_lines = [l for l in lines if len(l) >= 2]
+        text_lines.sort(key=lambda l: min(box[1] for box in l))
+
+        # Select strictly the top-most line of text (the second line with monster count is ignored)
+        top_line = text_lines[0] if text_lines else (lines[0] if lines else [])
+        if not top_line:
+            return roi
+
+        # 4. Horizontal clustering within top line: adaptive distance-based clustering scaled to character height
+        top_line.sort(key=lambda b: b[0])
+        char_heights = [b[3] for b in top_line]
+        p75_h = float(np.percentile(char_heights, 75)) if char_heights else 16.0
+        # In MSM font, inter-word space is ~1.0 * char_h; any gap > 1.30 * char_h isolates distant buildings/pins
+        max_gap = max(14, int(p75_h * 1.30))
+        clusters: List[List[Tuple[int, int, int, int, int]]] = []
+        cur: List[Tuple[int, int, int, int, int]] = [top_line[0]]
+        for b in top_line[1:]:
+            if b[0] - (cur[-1][0] + cur[-1][2]) <= max_gap:
+                cur.append(b)
+            else:
+                clusters.append(cur)
+                cur = [b]
+        clusters.append(cur)
+
+        # Primary title is the cluster with the largest cumulative letter area
+        t_cl = max(clusters, key=lambda cl: sum(b[4] for b in cl))
+        min_x = min(b[0] for b in t_cl)
+        max_x = max(b[0] + b[2] for b in t_cl)
+        min_y = min(b[1] for b in t_cl)
+        max_y = max(b[1] + b[3] for b in t_cl)
+
+        # Generous padding to ensure RapidOCR recognizes spaces and edge letters accurately
+        pad_x = max(14, int(rh * 0.18))
+        pad_y = max(6, int(rh * 0.10))
+        c_x1 = max(0, min_x - pad_x)
+        c_x2 = min(rw, max_x + pad_x)
+        c_y1 = max(0, min_y - pad_y)
+        c_y2 = min(rh, max_y + pad_y)
+        return roi[c_y1:c_y2, c_x1:c_x2]
+
     def recognize_card(self, card_bgr: np.ndarray) -> str:
         """Recognize island title from an island card crop using RapidOCR with fallback.
 
@@ -277,38 +410,26 @@ class LetterRecognizer:
         ocr = get_shared_ocr_engine()
         if ocr is not None:
             try:
-                h, w = card_bgr.shape[:2]
-                band = card_bgr[int(h * 0.04) : int(h * 0.35), int(w * 0.18) : int(w * 0.85)]
+                title_crop = self.extract_title_crop(card_bgr)
+                if title_crop is None or title_crop.size == 0:
+                    h, w = card_bgr.shape[:2]
+                    title_crop = card_bgr[int(h * 0.04) : int(h * 0.35), int(w * 0.18) : int(w * 0.85)]
+
                 # Direct line text recognition (bypasses full-frame detection, 25x faster)
-                if hasattr(ocr, "text_rec") and band.size > 0:
-                    rec_res, _ = ocr.text_rec([band])
-                    raw_str = rec_res[0][0] if (rec_res and rec_res[0]) else ""
-                    if raw_str.strip():
-                        s = raw_str.replace("\ufffd", "")
-                        s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
-                        s = re.sub(
-                            r"([a-zA-Z]{3,})(Island|Haven|Workshop|Oasis|Sanctum|Nexus|Carnival|Shanty)",
-                            r"\1 \2",
-                            s,
-                            flags=re.IGNORECASE,
-                        )
-                        s = re.sub(r"[ \t]+", " ", s).strip()
-                        tokens = s.split()
-                        while tokens and len(tokens[0]) == 1 and tokens[0] not in ("A", "I"):
-                            tokens = tokens[1:]
-                        if not tokens:
-                            tokens = s.split()
-                        formatted = []
-                        for tok in tokens:
-                            if len(tok) > 1:
-                                formatted.append(tok[0].upper() + tok[1:])
-                            else:
-                                formatted.append(tok.upper())
-                        clean_title = " ".join(formatted).strip()
-                        if clean_title:
-                            if chash != 0:
-                                self._hash_cache.append((chash, clean_title))
-                            return clean_title
+                if hasattr(ocr, "text_rec") and title_crop.size > 0:
+                    rec_res, _ = ocr.text_rec([title_crop])
+                    if rec_res and rec_res[0]:
+                        raw_str, rec_score = rec_res[0]
+                        if raw_str.strip():
+                            s = raw_str.replace("\ufffd", "")
+                            # Split camelCase / PascalCase word boundaries (e.g. EarthIsland -> Earth Island)
+                            s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
+                            s = re.sub(r"[ \t]+", " ", s).strip()
+                            clean_title = " ".join(w.capitalize() for w in s.split())
+                            if clean_title:
+                                if chash != 0:
+                                    self._hash_cache.append((chash, clean_title))
+                                return clean_title
 
                 # Full RapidOCR detection fallback if direct line recognition produces empty
                 res, _ = ocr(card_bgr)
@@ -321,9 +442,6 @@ class LetterRecognizer:
                         # Skip subtitle progress counters (e.g. 42/69, 0/32) and standalone digits
                         if re.search(r"^\d+\s*/\s*\d+$", s) or s.isdigit():
                             continue
-                        # Skip low-confidence single char noise
-                        if len(s) == 1 and (not s.isalnum() or score < 0.70):
-                            continue
                         # Filter elements positioned deep in card (subtitle area y > 48)
                         y_top = min(pt[1] for pt in box)
                         if y_top > 48:
@@ -333,30 +451,11 @@ class LetterRecognizer:
                     if items:
                         # Sort horizontally left-to-right
                         items.sort(key=lambda it: min(pt[0] for pt in it[0]))
-                        tokens = []
-                        for _, text, _ in items:
-                            for w_tok in text.split():
-                                tokens.append(w_tok)
-
-                        cleaned_tokens = []
-                        for i, tok in enumerate(tokens):
-                            if i > 0 and len(tok) > 1 and len(tokens[i - 1]) > 1:
-                                prev = cleaned_tokens[-1]
-                                if prev.endswith("I") and tok.startswith("I") and prev != "I":
-                                    cleaned_tokens[-1] = prev[:-1]
-                            cleaned_tokens.append(tok)
-
-                        raw_result = " ".join(cleaned_tokens).strip()
+                        raw_result = " ".join(it[1] for it in items).strip()
                         if raw_result.endswith("."):
                             raw_result = raw_result[:-1].strip()
-
-                        formatted = []
-                        for w_tok in raw_result.split():
-                            if len(w_tok) > 1:
-                                formatted.append(w_tok[0].upper() + w_tok[1:].lower())
-                            else:
-                                formatted.append(w_tok.upper())
-                        clean_title = " ".join(formatted).strip()
+                        raw_result = re.sub(r"([a-z])([A-Z])", r"\1 \2", raw_result)
+                        clean_title = " ".join(w.capitalize() for w in raw_result.split())
                         if clean_title:
                             if chash != 0:
                                 self._hash_cache.append((chash, clean_title))
@@ -391,36 +490,12 @@ class LetterRecognizer:
         if not island_name or not blacklist:
             return False
 
-        def words_match(a: str, b: str) -> bool:
-            if a == b:
-                return True
-            na = a.replace("l", "i").replace("1", "i")
-            nb = b.replace("l", "i").replace("1", "i")
-            if na == nb:
-                return True
-            if abs(len(na) - len(nb)) >= 2 and min(len(na), len(nb)) <= 4:
-                return False
-            if len(na) <= 4 and len(nb) <= 4 and na[0] != nb[0]:
-                return False
-            if na and nb and na[0] == nb[0]:
-                return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.50
-            return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.65
-
-        c_name = island_name.strip().lower()
         for item in blacklist:
-            clean_item = item.strip().lower()
+            clean_item = item.strip()
             if not clean_item:
                 continue
-            if c_name == clean_item:
+            if self.names_fuzzy_match(island_name, clean_item):
                 return True
-            w_cand = c_name.split()
-            w_item = clean_item.split()
-            if len(w_cand) > 1 and len(w_item) > 1:
-                if len(w_cand) == len(w_item) and all(words_match(a, b) for a, b in zip(w_cand, w_item)):
-                    return True
-            else:
-                if words_match(c_name, clean_item):
-                    return True
 
         return False
 

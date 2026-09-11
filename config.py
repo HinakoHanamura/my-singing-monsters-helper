@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -35,7 +36,10 @@ NormRect = Tuple[float, float, float, float]
 
 #: Repository root, derived from this file's location. Never a literal path, so
 #: the value is correct on any machine and for anyone who clones the repository.
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+else:
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def _in_project(relative: str) -> str:
@@ -477,7 +481,13 @@ class AppConfig:
 
 DEFAULT_CONFIG = AppConfig()
 
-SETTINGS_FILE = _in_project("user_settings.json")
+def _user_settings_path() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "user_settings.json")
+    return _in_project("user_settings.json")
+
+
+SETTINGS_FILE = _user_settings_path()
 
 
 def load_user_settings() -> dict:
