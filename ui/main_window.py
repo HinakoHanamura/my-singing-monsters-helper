@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
 from config import DEFAULT_CONFIG, AppConfig, load_user_settings, save_user_settings
 from core.bot_engine import BotEngine
 from core.minigames.memory_engine import MemoryEngine, RunnerParams
+from core.pipelines import ResourceOptions
 
 LEVEL_COLORS = {
     "INFO": "#8b95a5",
@@ -103,6 +105,16 @@ TRANSLATIONS = {
         "brake_first_island_tip": "Stops scrolling to top when the specified island appears at the top.",
         "first_island_placeholder": "First island name (e.g. Plant Island)",
         "first_island_save_tip": "Save first island name",
+        "settings_resource_title": "Resource Harvest Options:",
+        "tour_resource_scope": "Harvest Scope (Select resources to collect):",
+        "collect_piggy": "Piggy Bank (Collect all on island)",
+        "collect_piggy_tip": "Check to harvest piggy bank during island tour or all-resource collection.",
+        "collect_diamond": "Diamond Mine (Collect diamonds)",
+        "collect_diamond_tip": "Check to harvest diamond mine during island tour or all-resource collection.",
+        "collect_treats": "Bakery Treats (Collect food)",
+        "collect_treats_tip": "Check to harvest bakery food during island tour or all-resource collection.",
+        "collect_coin": "Monster Coins (Collect coins)",
+        "collect_coin_tip": "Check to harvest monster coins during island tour or all-resource collection.",
         "stats_idle": "Rounds 0 ｜ Clicks 0",
         "stats_memory": "Completed {first} Levels ｜ Flipped {second} Rounds",
         "stats_tour": "Tour Rounds {first} ｜ Clicks {second}",
@@ -165,6 +177,16 @@ TRANSLATIONS = {
         "brake_first_island_tip": "滑动置顶列表时，一旦在顶部检测到该首岛名称即完成初始化。",
         "first_island_placeholder": "首岛名称（如 Plant Island）",
         "first_island_save_tip": "保存首岛名称",
+        "settings_resource_title": "资源收集选项：",
+        "tour_resource_scope": "巡岛包含资源（勾选需要收集的项）：",
+        "collect_piggy": "小猪储蓄罐（全岛全收）",
+        "collect_piggy_tip": "开启后，在巡岛或资源全收时自动点击并确认小猪储蓄罐。",
+        "collect_diamond": "钻石矿（收集钻石）",
+        "collect_diamond_tip": "开启后，在巡岛或资源全收时自动寻找并收集钻石矿。",
+        "collect_treats": "烘焙坊食物（收集食物）",
+        "collect_treats_tip": "开启后，在巡岛或资源全收时自动寻找并收集烘焙坊食物。",
+        "collect_coin": "怪兽金币（收集金币）",
+        "collect_coin_tip": "开启后，在巡岛或资源全收时自动寻找并收集怪兽头顶金币。",
         "stats_idle": "轮次 0 ｜ 点击 0",
         "stats_memory": "已完成 {first} 关 ｜ 翻牌 {second} 轮",
         "stats_tour": "巡航轮次 {first} ｜ 点击 {second}",
@@ -210,6 +232,20 @@ QLabel#SectionTitle {
 QLabel#SectionDesc {
     color: #8892b0;
     font-size: 11px;
+}
+QFrame#TourResourceCard {
+    background-color: #171d26;
+    border: 1px solid #233247;
+    border-left: 3px solid #3b82f6;
+    border-radius: 8px;
+}
+QFrame#TourResourceCard:hover {
+    border-color: #3b82f6;
+}
+QLabel#TourResourceTitle {
+    color: #93c5fd;
+    font-size: 11px;
+    font-weight: 600;
 }
 QPushButton#TourButton {
     background-color: #1f242c;
@@ -489,6 +525,7 @@ class BlacklistRow(QWidget):
         self.edit.setObjectName("BlacklistRowEdit")
         self.edit.setText(self._confirmed_text)
         self.edit.textEdited.connect(self._on_text_edited)
+        self.edit.returnPressed.connect(self._on_btn_clicked)
         self.edit.installEventFilter(self)
 
         self.btn = QPushButton(self)
@@ -633,7 +670,19 @@ class BlacklistTableWidget(QWidget):
         for r in self._rows:
             r.update_language(lang)
 
+    def auto_confirm_pending(self) -> None:
+        """Confirm any trailing unconfirmed row that already contains valid text."""
+        for r in list(self._rows):
+            if not r.is_confirmed:
+                txt = r.edit.text().strip()
+                if txt:
+                    r._confirmed_text = txt
+                    r._is_confirmed = True
+                    r._update_btn_ui()
+                    r.confirmed.emit(r)
+
     def get_blacklist(self) -> List[str]:
+        self.auto_confirm_pending()
         items: List[str] = []
         for r in self._rows:
             t = r.confirmed_text.strip()
@@ -648,21 +697,34 @@ class BlacklistTableWidget(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, config: Optional[AppConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[AppConfig] = None,
+        settings: Optional[dict] = None,
+    ) -> None:
         super().__init__()
         self._cfg = config or DEFAULT_CONFIG
         self._worker: Optional[Union[BotEngine, MemoryEngine]] = None
         self._mode: str = MODE_MAP_TOUR
 
-        settings = load_user_settings() if "PYTEST_CURRENT_TEST" not in os.environ else {}
-        self._lang: str = settings.get("language", "zh")
-        saved_bl = settings.get("blacklist", None)
+        if settings is not None:
+            user_settings = settings
+        elif "PYTEST_CURRENT_TEST" not in os.environ:
+            user_settings = load_user_settings()
+        else:
+            user_settings = {}
+        self._lang: str = user_settings.get("language", "zh")
+        saved_bl = user_settings.get("blacklist", None)
         self._initial_bl = saved_bl if saved_bl is not None else self._cfg.map.blacklist
-        self._initial_scan_first = bool(settings.get("scan_first", False))
-        self._initial_reset_map = bool(settings.get("reset_map_to_top", True))
-        self._initial_brake_mode = str(settings.get("init_brake_mode", getattr(self._cfg.map, "init_brake_mode", "dynamic")))
-        self._initial_first_island_name = str(settings.get("first_island_name", getattr(self._cfg.map, "first_island_name", "Plant Island")))
+        self._initial_scan_first = bool(user_settings.get("scan_first", True))
+        self._initial_reset_map = bool(user_settings.get("reset_map_to_top", True))
+        self._initial_brake_mode = str(user_settings.get("init_brake_mode", getattr(self._cfg.map, "init_brake_mode", "dynamic")))
+        self._initial_first_island_name = str(user_settings.get("first_island_name", getattr(self._cfg.map, "first_island_name", "Plant Island")))
         self._saved_first_island_name = self._initial_first_island_name
+        self._initial_collect_piggy = bool(user_settings.get("collect_piggy", True))
+        self._initial_collect_diamond = bool(user_settings.get("collect_diamond", True))
+        self._initial_collect_treats = bool(user_settings.get("collect_treats", True))
+        self._initial_collect_coin = bool(user_settings.get("collect_coin", True))
 
         self.setMinimumSize(700, 530)
         self.resize(790, 620)
@@ -749,25 +811,72 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
 
+        # Row 1: Tour Action Button + High-lighted Resource Scope Card
         row1 = QHBoxLayout()
-        row1.setSpacing(10)
+        row1.setSpacing(12)
+        row1.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self._tour_button = QPushButton(objectName="TourButton")
         self._tour_button.setAccessibleName("开始全岛巡航")
         self._tour_button.setShortcut("F7")
         self._tour_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._tour_button.clicked.connect(self._on_start_tour_clicked)
+        row1.addWidget(self._tour_button, 0)
+
+        self._tour_resource_card = QFrame(objectName="TourResourceCard")
+        card_layout = QVBoxLayout(self._tour_resource_card)
+        card_layout.setContentsMargins(12, 6, 14, 6)
+        card_layout.setSpacing(4)
+
+        self._tour_res_title = QLabel(objectName="TourResourceTitle")
+        card_layout.addWidget(self._tour_res_title)
+
+        res_grid = QGridLayout()
+        res_grid.setContentsMargins(0, 0, 0, 0)
+        res_grid.setHorizontalSpacing(16)
+        res_grid.setVerticalSpacing(4)
+
+        self._collect_piggy_box = QCheckBox(objectName="CollectPiggyBox")
+        self._collect_piggy_box.setChecked(self._initial_collect_piggy)
+        self._collect_piggy_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._collect_piggy_box.toggled.connect(self._save_settings)
+        res_grid.addWidget(self._collect_piggy_box, 0, 0)
+
+        self._collect_diamond_box = QCheckBox(objectName="CollectDiamondBox")
+        self._collect_diamond_box.setChecked(self._initial_collect_diamond)
+        self._collect_diamond_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._collect_diamond_box.toggled.connect(self._save_settings)
+        res_grid.addWidget(self._collect_diamond_box, 0, 1)
+
+        self._collect_treats_box = QCheckBox(objectName="CollectTreatsBox")
+        self._collect_treats_box.setChecked(self._initial_collect_treats)
+        self._collect_treats_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._collect_treats_box.toggled.connect(self._save_settings)
+        res_grid.addWidget(self._collect_treats_box, 1, 0)
+
+        self._collect_coin_box = QCheckBox(objectName="CollectCoinBox")
+        self._collect_coin_box.setChecked(self._initial_collect_coin)
+        self._collect_coin_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._collect_coin_box.toggled.connect(self._save_settings)
+        res_grid.addWidget(self._collect_coin_box, 1, 1)
+
+        card_layout.addLayout(res_grid)
+        row1.addWidget(self._tour_resource_card, 0)
+        row1.addStretch(1)
+        layout.addLayout(row1)
+
+        # Row 2: Memory game on its own separate row
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
 
         self._minigame_button = QPushButton(objectName="MinigameButton")
         self._minigame_button.setAccessibleName("开始记忆小游戏")
         self._minigame_button.setShortcut("F11")
         self._minigame_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._minigame_button.clicked.connect(self._on_start_minigame_clicked)
-
-        row1.addWidget(self._tour_button)
-        row1.addWidget(self._minigame_button)
-        row1.addStretch(1)
-        layout.addLayout(row1)
+        row2.addWidget(self._minigame_button, 0)
+        row2.addStretch(1)
+        layout.addLayout(row2)
 
         layout.addWidget(QFrame(objectName="Divider"))
 
@@ -1054,6 +1163,15 @@ class MainWindow(QMainWindow):
         self._brake_first_island_radio.setToolTip(t["brake_first_island_tip"])
         self._first_island_edit.setPlaceholderText(t["first_island_placeholder"])
         self._first_island_btn.setToolTip(t["first_island_save_tip"])
+        self._tour_res_title.setText(t["tour_resource_scope"])
+        self._collect_piggy_box.setText(t["collect_piggy"])
+        self._collect_piggy_box.setToolTip(t["collect_piggy_tip"])
+        self._collect_diamond_box.setText(t["collect_diamond"])
+        self._collect_diamond_box.setToolTip(t["collect_diamond_tip"])
+        self._collect_treats_box.setText(t["collect_treats"])
+        self._collect_treats_box.setToolTip(t["collect_treats_tip"])
+        self._collect_coin_box.setText(t["collect_coin"])
+        self._collect_coin_box.setToolTip(t["collect_coin_tip"])
 
         self._tour_button.setShortcut("F7")
         self._minigame_button.setShortcut("F11")
@@ -1092,8 +1210,21 @@ class MainWindow(QMainWindow):
             "reset_map_to_top": self._reset_map_box.isChecked(),
             "init_brake_mode": brake_mode,
             "first_island_name": getattr(self, "_saved_first_island_name", "Plant Island"),
+            "collect_piggy": self._collect_piggy_box.isChecked(),
+            "collect_diamond": self._collect_diamond_box.isChecked(),
+            "collect_treats": self._collect_treats_box.isChecked(),
+            "collect_coin": self._collect_coin_box.isChecked(),
         }
         save_user_settings(data)
+
+    def get_resource_options(self) -> ResourceOptions:
+        """Return current user-configured resource collection preferences."""
+        return ResourceOptions(
+            piggy=self._collect_piggy_box.isChecked(),
+            diamond=self._collect_diamond_box.isChecked(),
+            treats=self._collect_treats_box.isChecked(),
+            coin=self._collect_coin_box.isChecked(),
+        )
 
     @Slot()
     def _on_start_tour_clicked(self) -> None:
@@ -1147,6 +1278,7 @@ class MainWindow(QMainWindow):
             )
         else:
             worker = BotEngine(config=self._cfg, mode=mode)
+            worker.set_resource_options(self.get_resource_options())
             if mode == MODE_MAP_TOUR:
                 worker.set_blacklist(self._blacklist_table.get_blacklist())
                 worker.set_reset_map_to_top(self._reset_map_box.isChecked())
@@ -1188,6 +1320,10 @@ class MainWindow(QMainWindow):
 
         self._scan_first_box.setEnabled(not running)
         self._reset_map_box.setEnabled(not running)
+        self._collect_piggy_box.setEnabled(not running)
+        self._collect_diamond_box.setEnabled(not running)
+        self._collect_treats_box.setEnabled(not running)
+        self._collect_coin_box.setEnabled(not running)
         if running:
             self._brake_dynamic_radio.setEnabled(False)
             self._brake_first_island_radio.setEnabled(False)

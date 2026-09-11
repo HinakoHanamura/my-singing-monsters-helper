@@ -109,3 +109,30 @@ def test_blacklist_delete_row(qapp: QApplication) -> None:
 
     assert table.get_blacklist() == ["First", "Third"]
     assert len(table._rows) == 3
+
+
+def test_blacklist_return_key_confirms_row(qapp: QApplication) -> None:
+    """Pressing Return/Enter in QLineEdit confirms the row."""
+    table = BlacklistTableWidget(initial_items=[])
+    last_row = table._rows[0]
+    last_row.edit.setText("Air Island")
+    last_row.edit.returnPressed.emit()
+
+    assert last_row.is_confirmed is True
+    assert last_row.btn.text() == "×"
+    assert table.get_blacklist() == ["Air Island"]
+    assert len(table._rows) == 2
+
+
+def test_blacklist_auto_confirm_on_get_blacklist(qapp: QApplication) -> None:
+    """Entering text in trailing row without clicking confirm still includes it in get_blacklist."""
+    table = BlacklistTableWidget(initial_items=["Plant Island"])
+    last_row = table._rows[-1]
+    assert last_row.is_confirmed is False
+    last_row.edit.setText("Water Island")
+
+    # Calling get_blacklist() auto-confirms pending text
+    bl = table.get_blacklist()
+    assert bl == ["Plant Island", "Water Island"]
+    assert last_row.is_confirmed is True
+

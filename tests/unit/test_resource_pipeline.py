@@ -90,6 +90,9 @@ class MockActionAgent:
         self.clicks.append((x, y))
         return True
 
+    def park_cursor(self) -> None:
+        pass
+
 
 class ScriptedVision(BaseVisionAgent):
     def __init__(self, script: dict[str, list[list[Detection]]]):
@@ -251,6 +254,56 @@ class TestAllResourcesPipeline:
             f"collect_{TARGET_COIN}",
         ]
 
+    def test_pipeline_skips_disabled_resources(self):
+        from core.pipelines import ResourceOptions
+
+        call_order = []
+        engine = BotEngine(
+            config=AppConfig(window=WindowConfig(title="mock")),
+            mode=EngineMode.ALL_RESOURCES,
+        )
+
+        def mock_piggy_stage():
+            call_order.append("piggy")
+            return True
+
+        def mock_collect(target_name, max_rounds, max_consecutive_empty=4):
+            call_order.append(f"collect_{target_name}")
+            return 1
+
+        engine._run_piggy_stage = mock_piggy_stage
+        engine._collect_target_until_empty = mock_collect
+
+        # Disable piggy and treats
+        engine.set_resource_options(
+            ResourceOptions(piggy=False, diamond=True, treats=False, coin=True)
+        )
+        engine._run_all_resources()
+
+        assert call_order == [
+            f"collect_{TARGET_DIAMOND}",
+            f"collect_{TARGET_COIN}",
+        ]
+
+    def test_pipeline_skips_all_when_all_disabled(self):
+        from core.pipelines import ResourceOptions
+
+        call_order = []
+        engine = BotEngine(
+            config=AppConfig(window=WindowConfig(title="mock")),
+            mode=EngineMode.ALL_RESOURCES,
+        )
+
+        engine._run_piggy_stage = lambda: call_order.append("piggy") or True
+        engine._collect_target_until_empty = lambda t, *a, **k: call_order.append(f"collect_{t}") or 1
+
+        engine.set_resource_options(
+            ResourceOptions(piggy=False, diamond=False, treats=False, coin=False)
+        )
+        engine._run_all_resources()
+
+        assert call_order == []
+
 
 class TestUIResourceControls:
     @pytest.fixture
@@ -291,3 +344,123 @@ class TestUIResourceControls:
         assert window._piggy_button.isEnabled()
         assert window._start_button.isEnabled()
         assert not window._stop_button.isEnabled()
+
+    def test_resource_checkboxes_default_checked(self, window):
+        assert window._collect_piggy_box.isChecked() is True
+        assert window._collect_diamond_box.isChecked() is True
+        assert window._collect_treats_box.isChecked() is True
+        assert window._collect_coin_box.isChecked() is True
+
+        opts = window.get_resource_options()
+        assert opts.piggy is True
+        assert opts.diamond is True
+        assert opts.treats is True
+        assert opts.coin is True
+
+    def test_resource_checkboxes_toggle_and_get_options(self, window):
+        window._collect_piggy_box.setChecked(False)
+        window._collect_coin_box.setChecked(False)
+
+        opts = window.get_resource_options()
+        assert opts.piggy is False
+        assert opts.diamond is True
+        assert opts.treats is True
+        assert opts.coin is False
+
+    def test_set_running_disables_resource_checkboxes(self, window):
+        window._set_running(True)
+        assert not window._collect_piggy_box.isEnabled()
+        assert not window._collect_diamond_box.isEnabled()
+        assert not window._collect_treats_box.isEnabled()
+        assert not window._collect_coin_box.isEnabled()
+
+        window._set_running(False)
+        assert window._collect_piggy_box.isEnabled()
+        assert window._collect_diamond_box.isEnabled()
+        assert window._collect_treats_box.isEnabled()
+        assert window._collect_coin_box.isEnabled()
+
+
+class TestTourCoordinatorBlacklist:
+    def test_tour_coordinator_safely_skips_blacklisted_island(self):
+        from core.pipelines import IslandTourCoordinator
+        from core.map_navigator import IslandCardInfo, ScreenState
+
+        logs = []
+        visited = []
+
+        class MockNav:
+            def __init__(self):
+                from core.letter_recognizer import LetterRecognizer
+                self._recognizer = LetterRecognizer()
+
+            @property
+            def letter_recognizer(self):
+                return self._recognizer
+
+            def detect_state(self, frame):
+                return ScreenState.MAP
+
+            def get_visible_cards(self, frame):
+                return [
+                    IslandCardInfo(
+                        index=0,
+                        name="Plant Island",
+                        rect=(0, 0, 100, 100),
+                        click_point=(50, 50),
+                        card_hash=12345,
+                        is_fully_visible=True,
+                    )
+                ]
+
+            def select_island(self, card):
+                pass
+
+            def enter_selected_island(self, target_card=None):
+                return True
+
+            def open_map(self):
+                return True
+
+            def scroll_down(self):
+                return False
+
+            def scroll_to_top(self, max_swipes=5):
+                return True
+
+            def brake_to_first_island(self, first_island_name="Plant Island", max_swipes=6):
+                return True
+
+            def wait_for_list_stable(self, timeout=1.2):
+                return True
+
+        nav = MockNav()
+        window = MockGameWindow(attached=True)
+        action = MockActionAgent()
+        interrupted = False
+
+        coordinator = IslandTourCoordinator(
+            nav=nav,
+            window=window,
+            action=action,
+            cfg=AppConfig(window=WindowConfig(title="mock")),
+            blacklist=["Plant Island"],
+            reset_map_to_top=False,
+            init_brake_mode="dynamic",
+            first_island_name="Plant Island",
+            on_harvest=lambda: visited.append("harvest"),
+            emit_log=lambda lvl, msg: logs.append((lvl, msg)),
+            sleep_timed=lambda sec: None,
+            timed=lambda name, fn, *a, **k: fn(*a, **k),
+            is_interrupted=lambda: interrupted,
+            set_state=lambda s: None,
+        )
+
+        coordinator.run()
+
+        intercept_logs = [msg for lvl, msg in logs if "黑名单拦截" in msg]
+        assert len(intercept_logs) == 1
+        assert "Plant Island" in intercept_logs[0]
+        assert len(visited) == 0
+
+

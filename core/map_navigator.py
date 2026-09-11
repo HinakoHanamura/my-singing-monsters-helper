@@ -119,6 +119,11 @@ class MapNavigator:
         self._roi_map_btn = DynamicROI("map_button", margin_x=60, margin_y=60)
         self._roi_close_btn = DynamicROI("map_close_or_back", margin_x=60, margin_y=60)
 
+    @property
+    def letter_recognizer(self) -> LetterRecognizer:
+        """Expose OCR recognizer instance for blacklist checks and title parsing."""
+        return self._recognizer
+
     def _get_scale_steps(self, frame: np.ndarray) -> Tuple[float, ...]:
         """Compute multi-scale factors relative to 1024x768 reference resolution."""
         if frame is None or frame.size == 0:

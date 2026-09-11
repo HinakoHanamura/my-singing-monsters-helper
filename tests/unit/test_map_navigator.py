@@ -365,6 +365,16 @@ def test_scroll_to_top_deceleration_and_stationary_comparison() -> None:
 
     ok = nav.scroll_to_top(max_swipes=5)
     assert ok is True
-    # Swipe 1: mid -> top (content changed -> continues)
-    # Swipe 2: top -> top (settled content identical -> stops)
     assert len(action.drags) == 2
+
+
+def test_map_navigator_letter_recognizer_property() -> None:
+    """MapNavigator.letter_recognizer property provides access to LetterRecognizer instance."""
+    window = MockWindow()
+    action = MockAction(window=window)
+    nav = MapNavigator(action_agent=action, window=window, config=DEFAULT_CONFIG)
+
+    assert nav.letter_recognizer is not None
+    assert nav.letter_recognizer is nav._recognizer
+    assert hasattr(nav.letter_recognizer, "is_blacklisted")
+

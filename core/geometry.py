@@ -13,7 +13,7 @@ there is no per-size parameter set to maintain.
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Any, List, Sequence, Tuple
 
 # Pixel rectangle (x1, y1, x2, y2); the bottom-right corner is exclusive.
 PixelRect = Tuple[int, int, int, int]
@@ -89,3 +89,39 @@ def rects_overlap(a: PixelRect, b: PixelRect) -> bool:
 
 def distance(a: Point, b: Point) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def inflate(box: PixelRect, margin: int) -> PixelRect:
+    """Grow a box on all sides. Used to treat touching boxes as interfering."""
+    x1, y1, x2, y2 = box
+    return x1 - margin, y1 - margin, x2 + margin, y2 + margin
+
+
+def select_independent(
+    candidates: Sequence[Any], limit: int, margin: int
+) -> List[Any]:
+    """Pick up to `limit` candidates that cannot interfere with each other."""
+    if limit <= 1:
+        return list(candidates[:1])
+
+    chosen: List[Any] = []
+    for candidate in candidates:
+        if len(chosen) >= limit:
+            break
+        cand_bbox = candidate.bbox if hasattr(candidate, "bbox") else getattr(candidate, "box", candidate)
+        padded = inflate(cand_bbox, margin)
+        if any(
+            rects_overlap(
+                padded,
+                inflate(
+                    other.bbox if hasattr(other, "bbox") else getattr(other, "box", other),
+                    margin,
+                ),
+            )
+            for other in chosen
+        ):
+            continue
+        chosen.append(candidate)
+
+    return chosen
+
