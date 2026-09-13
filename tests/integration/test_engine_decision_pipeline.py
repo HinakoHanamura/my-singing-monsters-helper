@@ -126,6 +126,7 @@ class EngineHarness:
         QTimer.singleShot(int(seconds * 1000) + 1500, qapp.quit)
         qapp.exec()
         assert self.engine.wait(4000), "engine thread did not finish in time"
+        qapp.processEvents()
         return self
 
     @property

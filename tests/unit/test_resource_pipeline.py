@@ -464,3 +464,94 @@ class TestTourCoordinatorBlacklist:
         assert len(visited) == 0
 
 
+def test_collect_target_dismisses_modal_and_resets_empty_count():
+    """When a modal covers the island during collection, it must be dismissed and empty count reset."""
+    from core.pipelines.resource_pipeline import ResourceHarvestPipeline
+    from core.click_guard import ClickGuard
+    from core.map_navigator import MatchResult, ScreenState
+
+    dismiss_calls = []
+    clicks = []
+    logs = []
+
+    class MockNavForHarvest:
+        def __init__(self):
+            self.has_modal = True
+
+        def find_modal_cancel(self, frame):
+            if self.has_modal:
+                return MatchResult(center=(1500, 800), rect=(1450, 750, 1550, 850), score=0.90)
+            return None
+
+        def detect_state(self, frame):
+            return ScreenState.MODAL if self.has_modal else ScreenState.ISLAND
+
+        def dismiss_modal(self, frame):
+            dismiss_calls.append("dismiss")
+            self.has_modal = False
+            return True
+
+    nav = MockNavForHarvest()
+
+    class MockVisionAgent(BaseVisionAgent):
+        def __init__(self):
+            self.coin_remaining = 2
+
+        def detect(self, target, frame):
+            if nav.has_modal:
+                return []
+            if self.coin_remaining > 0:
+                self.coin_remaining -= 1
+                return [Detection(name="coin", x=100, y=100, width=40, height=40, confidence=0.95)]
+            return []
+
+    dummy_frame = np.ones((768, 1024, 3), dtype=np.uint8) * 128
+
+    class MockWindow:
+        def ensure_attached(self):
+            return True
+        def capture(self):
+            return dummy_frame
+
+    class MockAction:
+        def set_scale(self, s): pass
+        def click(self, x, y):
+            clicks.append((x, y))
+            return True
+
+    cfg = AppConfig(window=WindowConfig(title="mock"))
+    guard = ClickGuard(safety=cfg.safety)
+    vision = MockVisionAgent()
+
+    pipeline = ResourceHarvestPipeline(
+        window=MockWindow(),
+        action=MockAction(),
+        vision=vision,
+        guard=guard,
+        cfg=cfg,
+        emit_log=lambda lvl, msg: logs.append((lvl, msg)),
+        set_state=lambda s: None,
+        sleep_timed=lambda s: None,
+        timed=lambda name, fn, *a, **k: fn(*a, **k),
+        filter_candidates=lambda targets, *a, **k: (targets, []),
+        click_batch=lambda batch, scale, **kwargs: [clicks.append(t.center) for t in batch] or len(batch),
+        is_interrupted=lambda: False,
+        nav=nav,
+    )
+
+    total_clicks = pipeline.collect_target_until_empty(
+        target_name=TARGET_COIN,
+        max_rounds=15,
+        max_consecutive_empty=3,
+    )
+
+    # Verify modal was dismissed
+    assert len(dismiss_calls) == 1
+    # Verify coins were collected after modal dismissal
+    assert len(clicks) == 2
+    # Verify log noted modal self-healing
+    heal_logs = [msg for lvl, msg in logs if "弹窗自愈" in msg]
+    assert len(heal_logs) >= 1
+
+
+

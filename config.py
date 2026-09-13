@@ -25,6 +25,7 @@ TARGET_DIAMOND = "diamond"
 TARGET_TREATS = "treats"
 TARGET_PIGGY_BANK = "piggy_bank"
 TARGET_MODAL_CONFIRM = "modal_confirm"
+TARGET_MODAL_CANCEL = "modal_cancel"
 TARGET_MAP_BUTTON = "map_button"
 TARGET_MAP_GO = "map_go"
 TARGET_MAP_YOU_ARE_HERE = "map_you_are_here"
@@ -364,10 +365,11 @@ class SafetyConfig:
     # escalates per consecutive failure at that position before a ban.
     #
     # Base cooldown, applied when the position has no failure history.
-    click_cooldown: float = 0.35
+    # Set to 1.2s to prevent re-clicking lingering collection animations.
+    click_cooldown: float = 1.2
     # Wait after 1, 2, 3... consecutive failures at one position. The last entry
     # repeats if there are more failures than steps.
-    failure_cooldown_ladder: Tuple[float, ...] = (1.0, 3.0, 8.0)
+    failure_cooldown_ladder: Tuple[float, ...] = (1.5, 3.5, 8.0)
     # Consecutive "clicked but the target stayed" events before banning.
     # One higher than before, because the ladder now absorbs early failures.
     blacklist_after_failures: int = 4
@@ -406,9 +408,8 @@ class SafetyConfig:
     verify_after_click: bool = True
     # Delay before the re-read, to let the collection animation finish.
     # Too short and a successful click reads as a failure, which would poison the
-    # blacklist with false bans. 0.28 still cleared the animation in live runs;
-    # if false bans appear, raise this first.
-    verify_delay: float = 0.28
+    # blacklist with false bans. Raised to 0.65s to clear full collection animation.
+    verify_delay: float = 0.65
     # Consecutive verified successes before switching to sampled verification.
     #
     # Lowered from 3 after live measurement: verification was 19-35% of round

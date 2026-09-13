@@ -9,6 +9,7 @@ env/
 
 # Captured game frames: large, machine-specific, not source
 captures/
+close/
 
 # Template assets are intentionally tracked, but keep scratch crops out
 assets/templates/_scratch/
@@ -39,6 +40,7 @@ junit*.xml
 # Local-only notes, planning documents, and scratchpad
 .agents/
 scratch/
+AGENTS.md
 
 # User local settings persistence
 user_settings.json

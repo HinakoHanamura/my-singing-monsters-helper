@@ -497,6 +497,16 @@ class BotEngine(QThread):
             self._sleep_timed(self._rng.uniform(*self._cfg.loop.tick_interval))
 
     def _create_resource_pipeline(self) -> ResourceHarvestPipeline:
+        nav = getattr(self, "_nav", None)
+        if nav is None:
+            from core.map_navigator import MapNavigator
+            nav = MapNavigator(
+                action_agent=self._action,
+                window=self._window,
+                config=self._cfg,
+            )
+            self._nav = nav
+
         return ResourceHarvestPipeline(
             window=self._window,
             action=self._action,
@@ -514,6 +524,7 @@ class BotEngine(QThread):
             on_round=self._on_pipeline_round,
             on_error=self._on_pipeline_error,
             rng=self._rng,
+            nav=nav,
         )
 
     def _on_pipeline_click(self, count: int = 1) -> None:
@@ -622,6 +633,7 @@ class BotEngine(QThread):
             window=self._window,
             config=replace(self._cfg, map=map_cfg),
         )
+        self._nav = nav
         coordinator = IslandTourCoordinator(
             nav=nav,
             window=self._window,
@@ -1102,7 +1114,7 @@ class BotEngine(QThread):
             remaining_ms -= step
 
     def _set_state(self, state: Union[BotState, str]) -> None:
-        if isinstance(state, str):
+        if not isinstance(state, BotState):
             mapping = {
                 "searching": BotState.SEARCHING,
                 "acting": BotState.ACTING,
@@ -1112,7 +1124,7 @@ class BotEngine(QThread):
                 "stopped": BotState.STOPPED,
                 "error": BotState.ERROR,
             }
-            state = mapping.get(state.lower(), BotState.SEARCHING)
+            state = mapping.get(str(state).lower(), BotState.SEARCHING)
         if state is not self._state:
             self._state = state
             self.state_changed.emit(state.value)

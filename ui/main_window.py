@@ -6,7 +6,7 @@ from datetime import datetime
 from dataclasses import replace
 from typing import List, Optional, Sequence, Union
 
-from PySide6.QtCore import QEvent, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QEvent, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from config import DEFAULT_CONFIG, AppConfig, load_user_settings, save_user_settings
+from core.audio_manager import GameAudioManager
 from core.bot_engine import BotEngine
 from core.minigames.memory_engine import MemoryEngine, RunnerParams
 from core.pipelines import ResourceOptions
@@ -123,6 +124,11 @@ TRANSLATIONS = {
         "warn_empty_target": "Please enter target island name first!",
         "log_ready": "Ready. Please launch the game window first.",
         "log_target": "Current target window: {title}",
+        "settings_audio_title": "Audio Options:",
+        "mute_game": "Mute Game",
+        "mute_game_tip": "Keep game audio muted without affecting other applications; restored when unchecked or closed",
+        "log_game_muted": "Game audio has been muted.",
+        "log_game_unmuted": "Game audio has been restored.",
         "log_help": "General Controls supports full island tour and memory game; Function Tests supports single resource tests.",
     },
     "zh": {
@@ -195,6 +201,11 @@ TRANSLATIONS = {
         "warn_empty_target": "请先输入要追踪的目标岛屿名称！",
         "log_ready": "就绪。请先启动游戏窗口。",
         "log_target": "当前目标窗口：{title}",
+        "settings_audio_title": "音频选项：",
+        "mute_game": "静音游戏",
+        "mute_game_tip": "使游戏保持静音，不影响电脑其他程序声音；取消勾选或退出时恢复",
+        "log_game_muted": "游戏音频已静音。",
+        "log_game_unmuted": "游戏音频已恢复。",
         "log_help": "「常规控制」页支持全岛巡检与记忆游戏（启动前请手动进入某一关的开局界面）；「功能测试」页支持单岛各单项采集与岛屿追踪测试。",
     },
 }
@@ -716,7 +727,7 @@ class MainWindow(QMainWindow):
         self._lang: str = user_settings.get("language", "zh")
         saved_bl = user_settings.get("blacklist", None)
         self._initial_bl = saved_bl if saved_bl is not None else self._cfg.map.blacklist
-        self._initial_scan_first = bool(user_settings.get("scan_first", True))
+        self._initial_scan_first = bool(user_settings.get("scan_first", False))
         self._initial_reset_map = bool(user_settings.get("reset_map_to_top", True))
         self._initial_brake_mode = str(user_settings.get("init_brake_mode", getattr(self._cfg.map, "init_brake_mode", "dynamic")))
         self._initial_first_island_name = str(user_settings.get("first_island_name", getattr(self._cfg.map, "first_island_name", "Plant Island")))
@@ -725,6 +736,8 @@ class MainWindow(QMainWindow):
         self._initial_collect_diamond = bool(user_settings.get("collect_diamond", True))
         self._initial_collect_treats = bool(user_settings.get("collect_treats", True))
         self._initial_collect_coin = bool(user_settings.get("collect_coin", True))
+        self._initial_mute_game = bool(user_settings.get("mute_game", False))
+        self._audio_mgr = GameAudioManager(window_title=self._cfg.window.title)
 
         self.setMinimumSize(700, 530)
         self.resize(790, 620)
@@ -744,6 +757,16 @@ class MainWindow(QMainWindow):
         self._append_log("INFO", t["log_ready"])
         self._append_log("INFO", t["log_target"].format(title=self._cfg.window.title))
         self._append_log("INFO", t["log_help"])
+
+        if self._initial_mute_game:
+            if self._audio_mgr.set_mute(True):
+                self._audio_mgr._muted_by_helper = True
+                self._append_log("INFO", t["log_game_muted"])
+
+        self._audio_timer = QTimer(self)
+        self._audio_timer.setInterval(2000)
+        self._audio_timer.timeout.connect(self._check_mute_sync)
+        self._audio_timer.start()
 
     def _build_ui(self) -> None:
         root = QWidget(objectName="Root")
@@ -1059,6 +1082,17 @@ class MainWindow(QMainWindow):
         layout.addLayout(brake_container)
         self._update_brake_controls_state()
 
+        layout.addWidget(QFrame(objectName="Divider"))
+
+        self._sec3_settings_title = QLabel(objectName="SectionTitle")
+        layout.addWidget(self._sec3_settings_title)
+
+        self._mute_game_box = QCheckBox(objectName="MuteGameBox")
+        self._mute_game_box.setChecked(self._initial_mute_game)
+        self._mute_game_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mute_game_box.toggled.connect(self._on_mute_game_toggled)
+        layout.addWidget(self._mute_game_box)
+
         layout.addStretch(1)
 
     def _on_reset_map_toggled(self, checked: bool) -> None:
@@ -1172,6 +1206,9 @@ class MainWindow(QMainWindow):
         self._collect_treats_box.setToolTip(t["collect_treats_tip"])
         self._collect_coin_box.setText(t["collect_coin"])
         self._collect_coin_box.setToolTip(t["collect_coin_tip"])
+        self._sec3_settings_title.setText(t["settings_audio_title"])
+        self._mute_game_box.setText(t["mute_game"])
+        self._mute_game_box.setToolTip(t["mute_game_tip"])
 
         self._tour_button.setShortcut("F7")
         self._minigame_button.setShortcut("F11")
@@ -1214,8 +1251,32 @@ class MainWindow(QMainWindow):
             "collect_diamond": self._collect_diamond_box.isChecked(),
             "collect_treats": self._collect_treats_box.isChecked(),
             "collect_coin": self._collect_coin_box.isChecked(),
+            "mute_game": self._mute_game_box.isChecked() if hasattr(self, "_mute_game_box") else getattr(self, "_initial_mute_game", False),
         }
         save_user_settings(data)
+
+    @Slot(bool)
+    def _on_mute_game_toggled(self, checked: bool) -> None:
+        self._save_settings()
+        t = TRANSLATIONS.get(self._lang, TRANSLATIONS["en"])
+        if checked:
+            if self._audio_mgr.set_mute(True):
+                self._audio_mgr._muted_by_helper = True
+                self._append_log("INFO", t["log_game_muted"])
+        else:
+            if self._audio_mgr.set_mute(False):
+                self._audio_mgr._muted_by_helper = False
+                self._append_log("INFO", t["log_game_unmuted"])
+
+    @Slot()
+    def _check_mute_sync(self) -> None:
+        """Periodic sync: if mute is enabled in UI and game is unmuted, enforce mute."""
+        if hasattr(self, "_mute_game_box") and self._mute_game_box.isChecked():
+            if not self._audio_mgr.is_muted():
+                if self._audio_mgr.set_mute(True):
+                    self._audio_mgr._muted_by_helper = True
+                    t = TRANSLATIONS.get(self._lang, TRANSLATIONS["en"])
+                    self._append_log("INFO", t["log_game_muted"])
 
     def get_resource_options(self) -> ResourceOptions:
         """Return current user-configured resource collection preferences."""
@@ -1296,6 +1357,14 @@ class MainWindow(QMainWindow):
 
         self._on_stats_changed(0, 0)
         self._set_running(True)
+
+        if hasattr(self, "_mute_game_box") and self._mute_game_box.isChecked():
+            if not self._audio_mgr.is_muted():
+                if self._audio_mgr.set_mute(True):
+                    self._audio_mgr._muted_by_helper = True
+                    t = TRANSLATIONS.get(self._lang, TRANSLATIONS["en"])
+                    self._append_log("INFO", t["log_game_muted"])
+
         worker.start()
 
     @Slot()
@@ -1369,6 +1438,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._save_settings()
+        if hasattr(self, "_audio_mgr"):
+            self._audio_mgr.restore_sound()
         worker = self._worker
         if worker is not None and worker.isRunning():
             worker.stop()

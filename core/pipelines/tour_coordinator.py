@@ -170,6 +170,25 @@ class IslandTourCoordinator:
                 )
             return enqueued
 
+        # Clean up any startup popups/ads dynamically until no close button remains
+        for _ in range(8):
+            if self._is_interrupted():
+                return
+            frame = self._timed("capture", self._window.capture)
+            if frame is None:
+                break
+            if hasattr(nav, "find_modal_cancel") and nav.find_modal_cancel(frame) is not None:
+                self._emit_log("INFO", "【开局自愈】 检测到界面存在广告/弹窗遮挡，正在自动关闭…")
+                nav.dismiss_modal(frame)
+                self._sleep_timed(0.35)
+            else:
+                break
+
+        frame = self._timed("capture", self._window.capture)
+        if frame is None:
+            self._emit_log("ERROR", "未能捕获游戏画面，退出巡岛")
+            return
+
         cur_state = nav.detect_state(frame)
 
         if cur_state != ScreenState.MAP:
@@ -195,11 +214,9 @@ class IslandTourCoordinator:
 
         consecutive_no_progress = 0
         target_miss_count = 0
+        empty_cards_streak = 0
 
         while not self._is_interrupted():
-            if hasattr(nav, "wait_for_list_stable"):
-                nav.wait_for_list_stable(timeout=1.2)
-
             frame = self._timed("capture", self._window.capture)
             if frame is None:
                 break
@@ -217,8 +234,12 @@ class IslandTourCoordinator:
             elif cur_st != ScreenState.MAP:
                 self._emit_log(
                     "WARN",
-                    "【界面校准】 检测到当前画面未在地图界面（状态: %s），正在重新打开地图界面…" % cur_st.value,
+                    "【界面校准】 检测到当前画面未在地图界面（状态: %s），正在解除界面遮挡…" % cur_st.value,
                 )
+                if hasattr(nav, "dismiss_modal") and nav.dismiss_modal(frame):
+                    self._emit_log("INFO", "【弹窗自愈】 检测到界面存在弹窗/全屏遮挡，已通过红 X/ESC 成功关闭…")
+                    self._sleep_timed(0.3)
+                    continue
                 if not nav.open_map():
                     self._emit_log("ERROR", "未能返回地图界面，巡岛中止")
                     return
@@ -226,9 +247,21 @@ class IslandTourCoordinator:
 
             cards = nav.get_visible_cards(frame)
             if not cards:
+                empty_cards_streak += 1
+                if hasattr(nav, "dismiss_modal") and nav.dismiss_modal(frame):
+                    self._emit_log(
+                        "INFO",
+                        "【弹窗自愈】 检测到弹窗阻挡地图卡片列表，已通过红 X/ESC 成功关闭",
+                    )
+                    empty_cards_streak = 0
+                    self._sleep_timed(0.3)
+                    continue
+
                 self._emit_log("WARN", "未检测到可见岛屿卡片，尝试滑动列表…")
                 nav.scroll_down()
                 continue
+            else:
+                empty_cards_streak = 0
 
             # Update queue with cards discovered below current anchor
             scan_and_enqueue_downward(cards)
@@ -301,9 +334,8 @@ class IslandTourCoordinator:
                         entered = True
                         self._emit_log("INFO", "【状态自愈】 画面已确认进入岛屿 '%s'" % target_disp_name)
                     else:
-                        self._emit_log("WARN", "未能进入岛屿 '%s'，跳过该岛屿" % target_disp_name)
-                        mark_card_visited(target_card)
-                        last_anchor = target
+                        self._emit_log("WARN", "未能进入岛屿 '%s'，保留待巡检队列稍后重试" % target_disp_name)
+                        island_queue.appendleft(target)
                         continue
 
                 # Inside island: run resource collection pipeline

@@ -3,6 +3,7 @@ pywin32==312
 numpy==2.2.5
 opencv-python==4.11.0.86
 rapidocr-onnxruntime==1.4.4
+pycaw>=20240210
 
 # Development / test only
 pytest==8.4.2

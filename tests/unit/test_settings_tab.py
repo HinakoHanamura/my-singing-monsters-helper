@@ -22,14 +22,14 @@ def test_settings_tab_initialization(qapp, monkeypatch, tmp_path) -> None:
     # 4 tabs total
     assert win._tabs.count() == 4
 
-    # Memory game scan_first default is True
-    assert win._scan_first_box.isChecked() is True
+    # Memory game scan_first default is False
+    assert win._scan_first_box.isChecked() is False
 
     # Toggle scan_first
-    win._scan_first_box.setChecked(False)
-    assert win._scan_first_box.isChecked() is False
     win._scan_first_box.setChecked(True)
     assert win._scan_first_box.isChecked() is True
+    win._scan_first_box.setChecked(False)
+    assert win._scan_first_box.isChecked() is False
 
     # Map initialization auto-scroll to top defaults to True
     assert win._reset_map_box.isChecked() is True
@@ -65,10 +65,20 @@ def test_settings_tab_initialization(qapp, monkeypatch, tmp_path) -> None:
     assert win._collect_treats_box.isChecked() is True
     assert win._collect_coin_box.isChecked() is True
 
+    # Audio options: mute_game defaults to False, labeled "Mute Game" in Chinese UI
+    assert win._mute_game_box.isChecked() is False
+    assert win._mute_game_box.text() == "静音游戏"
+    win._mute_game_box.setChecked(True)
+    assert win._mute_game_box.isChecked() is True
+
     # Toggle options and verify persistence
     win._collect_piggy_box.setChecked(False)
     win._collect_treats_box.setChecked(False)
     win._save_settings()
+
+    # Verify saved dictionary contains mute_game
+    saved_data = load_user_settings()
+    assert saved_data.get("mute_game") is True
 
     # Re-initialize MainWindow from saved settings
     win2 = MainWindow(config=DEFAULT_CONFIG, settings=load_user_settings())
@@ -76,5 +86,6 @@ def test_settings_tab_initialization(qapp, monkeypatch, tmp_path) -> None:
     assert win2._collect_diamond_box.isChecked() is True
     assert win2._collect_treats_box.isChecked() is False
     assert win2._collect_coin_box.isChecked() is True
+    assert win2._mute_game_box.isChecked() is True
 
 

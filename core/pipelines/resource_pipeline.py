@@ -19,6 +19,7 @@ from core.action_agent import ActionAgent
 from core.click_guard import ClickGuard
 from core.game_window import GameWindow
 from core.geometry import scale_factor, scale_length, select_independent
+from core.map_navigator import ScreenState
 from core.vision_agent import BaseVisionAgent, check_piggy_status
 
 
@@ -53,6 +54,7 @@ class ResourceHarvestPipeline:
         on_round: Optional[Callable[[], None]] = None,
         on_error: Optional[Callable[[], None]] = None,
         rng: Optional[np.random.Generator] = None,
+        nav: Optional[Any] = None,
     ) -> None:
         self._window = window
         self._action = action
@@ -70,6 +72,7 @@ class ResourceHarvestPipeline:
         self._on_round = on_round or (lambda: None)
         self._on_error = on_error or (lambda: None)
         self._rng = rng or np.random.default_rng()
+        self._nav = nav
 
     def run_piggy_stage(self) -> bool:
         """Attempt to activate and confirm the piggy bank if bright.
@@ -102,8 +105,21 @@ class ResourceHarvestPipeline:
                 "detect", self._vision.detect, TARGET_PIGGY_BANK, frame
             )
             if not piggies:
-                self._emit_log("INFO", "未检测到小猪储蓄罐图标（本岛无储蓄罐或被遮挡），跳过")
-                return False
+                if self._nav is not None and hasattr(self._nav, "find_modal_cancel"):
+                    modal_match = self._nav.find_modal_cancel(frame)
+                    if modal_match is not None:
+                        if self._nav.dismiss_modal(frame):
+                            self._emit_log("INFO", "【弹窗自愈】 检测到弹窗遮挡储蓄罐，已自动关闭…")
+                            self._sleep_timed(0.35)
+                            fresh = self._timed("capture", self._window.capture)
+                            if fresh is not None:
+                                frame = fresh
+                                piggies = self._timed(
+                                    "detect", self._vision.detect, TARGET_PIGGY_BANK, frame
+                                )
+                if not piggies:
+                    self._emit_log("INFO", "未检测到小猪储蓄罐图标（本岛无储蓄罐或被遮挡），跳过")
+                    return False
 
             piggy = piggies[0]
             crop = frame[
@@ -220,7 +236,19 @@ class ResourceHarvestPipeline:
                     f"未发现可收集的{label}（{consecutive_empty}/{max_consecutive_empty}）",
                 )
                 if consecutive_empty >= max_consecutive_empty:
+                    # Critical point: before declaring the island clean, verify if a modal popup occluded the view
+                    if self._nav is not None and hasattr(self._nav, "find_modal_cancel"):
+                        modal_match = self._nav.find_modal_cancel(frame)
+                        if modal_match is not None and self._nav.dismiss_modal(frame):
+                            self._emit_log(
+                                "INFO",
+                                f"【弹窗自愈】 检测到弹窗遮挡{label}收集界面，已自动关闭，重置检测…",
+                            )
+                            consecutive_empty = 0
+                            self._sleep_timed(0.35)
+                            continue
                     break
+
                 self._sleep_timed(self._rng.uniform(*self._cfg.loop.tick_interval))
                 continue
 

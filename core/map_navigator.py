@@ -8,6 +8,7 @@ from typing import Callable, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
+import win32con
 
 from config import (
     DEFAULT_CONFIG,
@@ -17,7 +18,7 @@ from config import (
     AppConfig,
 )
 from core.action_agent import ActionAgent
-from core.adaptive_roi import DynamicROI, MatchResult
+from core.adaptive_roi import DynamicROI, MatchResult, _scale_template
 from core.game_window import GameWindow
 from core.letter_recognizer import LetterRecognizer, get_shared_ocr_engine
 
@@ -30,6 +31,7 @@ class ScreenState(str, Enum):
     ISLAND = "island"
     MAP = "map"
     LOADING = "loading"
+    MODAL = "modal"
     UNKNOWN = "unknown"
 
 
@@ -112,12 +114,15 @@ class MapNavigator:
         self._close_btn_tmpl = cv2.imread(f"{template_dir}/map_close_button.png")
         self._back_btn_tmpl = cv2.imread(f"{template_dir}/map_back_button.png")
         self._card_rail_tmpl = cv2.imread(f"{template_dir}/map_card_rail.png")
+        self._modal_cancel_tmpl = cv2.imread(f"{template_dir}/modal_cancel.png")
+        self._modal_cancel_round_tmpl = cv2.imread(f"{template_dir}/modal_cancel_round.png")
 
         # Dynamic ROI trackers (default: no ROI -> global scan fallback)
         self._roi_go = DynamicROI("map_go", margin_x=80, margin_y=80)
         self._roi_here = DynamicROI("map_here", margin_x=80, margin_y=80)
         self._roi_map_btn = DynamicROI("map_button", margin_x=60, margin_y=60)
         self._roi_close_btn = DynamicROI("map_close_or_back", margin_x=60, margin_y=60)
+        self._roi_modal_cancel = DynamicROI("modal_cancel", margin_x=60, margin_y=60)
 
     @property
     def letter_recognizer(self) -> LetterRecognizer:
@@ -146,16 +151,22 @@ class MapNavigator:
         h, w = frame.shape[:2]
         ui_scale = h / 768.0
 
+        # Check for close/cancel buttons first (modal popups darken screen corners with a dark scrim)
+        modal_cancel_res = self.find_modal_cancel(frame)
+
         # 1. Fast loading check (< 0.1ms): dark iris transition or low-variance frame
-        corner_margin = max(10, int(40 * ui_scale))
-        top_left_dark = float(frame[:corner_margin, :corner_margin].mean()) < 35.0
-        top_right_dark = float(frame[:corner_margin, -corner_margin:].mean()) < 35.0
-        if (top_left_dark and top_right_dark) or float(frame.std()) < 18.0 or float(frame.mean()) < 25.0:
-            return ScreenState.LOADING
+        # (Guarded: a loading screen never has a close button)
+        if modal_cancel_res is None:
+            corner_margin = max(10, int(40 * ui_scale))
+            top_left_dark = float(frame[:corner_margin, :corner_margin].mean()) < 35.0
+            top_right_dark = float(frame[:corner_margin, -corner_margin:].mean()) < 35.0
+            if (top_left_dark and top_right_dark) or float(frame.std()) < 18.0 or float(frame.mean()) < 25.0:
+                return ScreenState.LOADING
 
         scales = self._get_scale_steps(frame)
 
         # 2. Fast structural check for Map view: presence of vertical island card rail grooves (< 8ms)
+        spacings = []
         if self._card_rail_tmpl is not None:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             th_tmpl = cv2.cvtColor(self._card_rail_tmpl, cv2.COLOR_BGR2GRAY)
@@ -184,7 +195,7 @@ class MapNavigator:
                 if len(spacings) >= 2:
                     return ScreenState.MAP
 
-        # 3. Check for Map view: GO button, CLOSE button, or BACK button (full-frame match)
+        # 3. Check for Map view: GO button, 'You are here!' button, or CLOSE button
         if self._go_clean_tmpl is not None or self._go_btn_tmpl is not None:
             go_tmpls = [("clean", self._go_clean_tmpl), ("plant", self._go_btn_tmpl)]
             valid_go = [(name, t) for name, t in go_tmpls if t is not None]
@@ -195,41 +206,66 @@ class MapNavigator:
                 if go_res is not None:
                     return ScreenState.MAP
 
-        if self._close_btn_tmpl is not None:
+        if self._here_clean_tmpl is not None or self._here_btn_tmpl is not None:
+            here_tmpls = [("clean", self._here_clean_tmpl), ("faded", self._here_btn_tmpl)]
+            valid_here = [(name, t) for name, t in here_tmpls if t is not None]
+            if valid_here:
+                here_res = self._roi_here.match_any(
+                    frame, valid_here, threshold=0.55, scales=scales
+                )
+                if here_res is not None:
+                    return ScreenState.MAP
+
+        # Check for close/cancel buttons (modal red X, stone close, back)
+        modal_cancel_res = self.find_modal_cancel(frame)
+        close_res = None
+        if modal_cancel_res is None and self._close_btn_tmpl is not None:
             close_res = self._roi_close_btn.match(
                 frame, self._close_btn_tmpl, threshold=0.58, scales=scales
             )
-            if close_res is not None:
-                return ScreenState.MAP
 
-        if self._back_btn_tmpl is not None:
+        back_res = None
+        if modal_cancel_res is None and close_res is None and self._back_btn_tmpl is not None:
             back_res = self._roi_close_btn.match(
                 frame, self._back_btn_tmpl, threshold=0.88, scales=scales
             )
-            if back_res is not None:
-                return ScreenState.MAP
 
-        # 4. Check for Island view: MAP button on screen (full-frame match)
+        if modal_cancel_res is not None or close_res is not None or back_res is not None:
+            # A close/back button alone is common to dialogs (Mailbox, Ads, Settings, etc.).
+            # Positively identify MAP only if genuine card rails or multiple visible island cards exist.
+            if len(spacings) >= 2 or len(self.get_visible_cards(frame)) >= 2:
+                return ScreenState.MAP
+            return ScreenState.MODAL
+
+        # 4. Check for Island view: MAP button on screen
         if self._map_btn_tmpl is not None:
             map_res = self._roi_map_btn.match(
-                frame, self._map_btn_tmpl, threshold=0.65, scales=scales
+                frame, self._map_btn_tmpl, threshold=0.58, scales=scales
             )
             if map_res is not None:
                 return ScreenState.ISLAND
 
-        # 5. High-reliability OCR fallback on screen (only when visual matching is ambiguous)
+        # 5. High-reliability OCR fallback on HUD ROI (strictly restricted to avoid full-frame delay)
         ocr = get_shared_ocr_engine()
         if ocr is not None:
             try:
-                rec_res, _ = ocr(frame)
+                # Check bottom HUD bar for Island navigation buttons
+                bottom_crop = frame[int(h * 0.70):, :]
+                rec_res, _ = ocr(bottom_crop)
                 if rec_res:
                     for box, text, score in rec_res:
                         clean_t = text.strip().upper()
-                        if score >= 0.70:
-                            if clean_t in ("MAP", "COLLECT ALL", "COLLECTALL", "MARKET", "MAILBOX"):
-                                return ScreenState.ISLAND
-                            if clean_t in ("CLOSE", "MIRROR"):
-                                return ScreenState.MAP
+                        if score >= 0.70 and clean_t in ("MAP", "COLLECT ALL", "COLLECTALL", "MARKET"):
+                            return ScreenState.ISLAND
+
+                # Check left list area for Map markers (e.g. Mirror islands)
+                left_crop = frame[:, :int(w * 0.35)]
+                rec_left, _ = ocr(left_crop)
+                if rec_left:
+                    for box, text, score in rec_left:
+                        clean_t = text.strip().upper()
+                        if score >= 0.70 and clean_t in ("MIRROR",):
+                            return ScreenState.MAP
             except Exception:
                 pass
 
@@ -254,14 +290,171 @@ class MapNavigator:
 
     # ---------------------------------------------------- High-Level Commands
 
-    def open_map(self, timeout: float = 6.0) -> bool:
+    def find_modal_cancel(
+        self,
+        frame: np.ndarray,
+        threshold: float = 0.68,
+    ) -> Optional[MatchResult]:
+        """Perform full-frame multi-scale search for modal cancel/close buttons.
+
+        Uses coarse-to-fine downsampled matching with local native refinement
+        to achieve sub-tenth-second detection across high-resolution frames.
+        Supports various close button variants (square stone red X, round vine red X,
+        or stone CLOSE button) anywhere across the entire screen without spatial restrictions.
+        """
+        if frame is None or frame.size == 0:
+            return None
+        h, w = frame.shape[:2]
+        ds = 0.5 if (w >= 1200 or h >= 900) else 1.0
+        if ds != 1.0:
+            small = cv2.resize(frame, (int(w * ds), int(h * ds)), interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
+
+        scales = self._get_scale_steps(frame)
+        candidate_tmpls = [
+            self._modal_cancel_tmpl,
+            getattr(self, "_modal_cancel_round_tmpl", None),
+            self._close_btn_tmpl,
+        ]
+        valid_tmpls = [t for t in candidate_tmpls if t is not None]
+
+        best_score = -1.0
+        best_info = None
+
+        for tmpl in valid_tmpls:
+            for s in scales:
+                scaled = _scale_template(tmpl, s * ds)
+                th, tw = scaled.shape[:2]
+                sh, sw = small.shape[:2]
+                if sh >= th and sw >= tw:
+                    res = cv2.matchTemplate(small, scaled, cv2.TM_CCOEFF_NORMED)
+                    _, max_v, _, loc = cv2.minMaxLoc(res)
+                    if max_v >= (threshold - 0.05) and max_v > best_score:
+                        best_score = max_v
+                        best_info = (tmpl, s, loc, tw, th)
+                    if max_v >= 0.85:
+                        break
+            if best_score >= 0.85:
+                break
+
+        if best_info is None or best_score < (threshold - 0.05):
+            return None
+
+        tmpl, s, loc, tw, th = best_info
+        if ds == 1.0:
+            if best_score >= threshold:
+                cx = loc[0] + tw // 2
+                cy = loc[1] + th // 2
+                rect = (loc[0], loc[1], loc[0] + tw, loc[1] + th)
+                return MatchResult(center=(cx, cy), rect=rect, score=float(best_score))
+            return None
+
+        # Refine on native resolution
+        scaled_native = _scale_template(tmpl, s)
+        nth, ntw = scaled_native.shape[:2]
+        est_x = int(loc[0] / ds)
+        est_y = int(loc[1] / ds)
+        margin = int(24 / ds)
+        x0 = max(0, est_x - margin)
+        y0 = max(0, est_y - margin)
+        x1 = min(w, est_x + ntw + margin)
+        y1 = min(h, est_y + nth + margin)
+
+        patch = frame[y0:y1, x0:x1]
+        if patch.shape[0] >= nth and patch.shape[1] >= ntw:
+            res_fine = cv2.matchTemplate(patch, scaled_native, cv2.TM_CCOEFF_NORMED)
+            _, fine_v, _, fine_loc = cv2.minMaxLoc(res_fine)
+            if fine_v >= threshold:
+                fx = x0 + fine_loc[0] + ntw // 2
+                fy = y0 + fine_loc[1] + nth // 2
+                rect = (x0 + fine_loc[0], y0 + fine_loc[1], x0 + fine_loc[0] + ntw, y0 + fine_loc[1] + nth)
+                return MatchResult(center=(fx, fy), rect=rect, score=float(fine_v))
+        return None
+
+    def dismiss_modal(self, frame: Optional[np.ndarray] = None) -> bool:
+        """Check if a modal dialog with close button is on screen and dismiss it.
+
+        1. Finds close button anywhere on screen via full-frame matching.
+        2. First clicks the detected close button directly.
+        3. Verifies that the close button has disappeared; if still present, sends ESC.
+        Returns True if a modal was detected and dismissed, False otherwise.
+        """
+        if frame is None:
+            frame = self._window.capture()
+            if frame is None or frame.size == 0:
+                return False
+
+        match = self.find_modal_cancel(frame)
+        if match is None:
+            return False
+
+        cx, cy = match.center
+        logger.info("detected modal close button at (%d, %d); clicking close button", cx, cy)
+        self._action.click(cx, cy)
+        time.sleep(0.35)
+
+        # Verification: check if modal close button has disappeared
+        fresh = self._window.capture()
+        if fresh is not None and fresh.size > 0:
+            fresh_match = self.find_modal_cancel(fresh)
+            if fresh_match is not None and abs(fresh_match.center[0] - cx) < 35 and abs(fresh_match.center[1] - cy) < 35:
+                # Still present at same location; try ESC as fallback
+                logger.info("modal close button still present at (%d, %d); sending ESC fallback", cx, cy)
+                self._action.send_key(win32con.VK_ESCAPE)
+                time.sleep(0.35)
+
+        return True
+
+    def recover_blocked_island_ui(self, frame: Optional[np.ndarray] = None) -> bool:
+        """Self-healing: dismiss modal popups or deselect selected apparatus/monsters.
+
+        1. If a modal dialog with a red 'X' close button is detected anywhere on screen:
+           Dismisses via dismiss_modal() (ESC key or direct Red X click).
+        2. If no modal dialog is present, an apparatus or monster is likely selected:
+           Zooms out via multi-notch wheel centered on screen, waits for camera easing,
+           then clicks the safe lower-left ocean void (offset to the right of the zoom-out
+           minus icon) to safely clear the selection without hitting any buildings or monsters.
+        """
+        if frame is None or frame.size == 0:
+            frame = self._window.capture()
+            if frame is None or frame.size == 0:
+                return False
+
+        # 1. Check for modal popup with Red X
+        if self.dismiss_modal(frame):
+            return True
+
+        # 2. Deselect building / monster selection:
+        logger.info("executing deselect recovery: zoom out and click lower-left safe ocean")
+        h, w = frame.shape[:2]
+        center_x = w // 2
+        center_y = h // 2
+
+        # Send 3 wheel notches centered on screen to smoothly zoom out
+        self._action.wheel(-120, x=center_x, y=center_y, steps=3, step_delay=0.03)
+        # Wait for game camera zoom easing animation to complete
+        time.sleep(0.45)
+
+        # safe_x is to the right of minus button (x ~ 110-120), safe_y is around 670-690
+        safe_x = int(w * 0.11)
+        safe_y = int(h * 0.88)
+        self._action.click(safe_x, safe_y)
+        time.sleep(0.25)
+        return True
+
+    def open_map(self, timeout: float = 8.0) -> bool:
         """From island view, click the MAP button and wait for the map interface.
 
         Active retry mechanism: continuously checks state, locates the MAP button
         with multi-scale adaptation, clicks it, and confirms entry.
+        If MAP button is missing, automatically recovers from modal popups or
+        accidentally selected apparatus/monsters.
         """
         deadline = time.monotonic() + timeout
         last_click_time = 0.0
+        last_recovery_time = 0.0
+        recovery_attempts = 0
 
         while time.monotonic() < deadline:
             frame = self._window.capture()
@@ -276,6 +469,15 @@ class MapNavigator:
                 self.wait_for_list_stable(timeout=1.2)
                 return True
 
+            # Priority: if a modal dialog is on screen, dismiss it first and reset timeout
+            modal_cancel = self.find_modal_cancel(frame)
+            if modal_cancel is not None:
+                logger.info("open_map: modal popup detected on island; dismissing it")
+                self.dismiss_modal(frame)
+                deadline = time.monotonic() + timeout
+                time.sleep(0.35)
+                continue
+
             if self._map_btn_tmpl is None:
                 logger.error("MAP button template not available")
                 return False
@@ -285,19 +487,21 @@ class MapNavigator:
                 frame, self._map_btn_tmpl, threshold=0.55, scales=scales
             )
 
-            # OCR fallback for MAP button on full frame
+            # OCR fallback for MAP button: strictly restricted to bottom HUD bar
             if match_res is None:
                 ocr = get_shared_ocr_engine()
                 if ocr is not None:
                     try:
-                        rec_res, _ = ocr(frame)
+                        h, w = frame.shape[:2]
+                        bottom_crop = frame[int(h * 0.70):, :]
+                        rec_res, _ = ocr(bottom_crop)
                         if rec_res:
                             for box, text, score in rec_res:
                                 if text.strip().upper() == "MAP" and score >= 0.70:
                                     bx1 = min(pt[0] for pt in box)
                                     bx2 = max(pt[0] for pt in box)
-                                    by1 = min(pt[1] for pt in box)
-                                    by2 = max(pt[1] for pt in box)
+                                    by1 = min(pt[1] for pt in box) + int(h * 0.70)
+                                    by2 = max(pt[1] for pt in box) + int(h * 0.70)
                                     btn_cx = int((bx1 + bx2) / 2)
                                     btn_cy = int(by1 - (by2 - by1) * 1.2)
                                     match_res = MatchResult(
@@ -330,6 +534,15 @@ class MapNavigator:
                     logger.info("already on map screen")
                     self.wait_for_list_stable(timeout=1.2)
                     return True
+
+                # Self-healing: if MAP button is missing, UI may be blocked by a modal popup or selected building
+                if (now - last_recovery_time >= 1.2) and (recovery_attempts < 3):
+                    logger.warning("MAP button not found on screen, attempting UI recovery...")
+                    if self.recover_blocked_island_ui(frame):
+                        last_recovery_time = time.monotonic()
+                        recovery_attempts += 1
+                        time.sleep(0.2)
+                        continue
 
             time.sleep(0.1)
 
@@ -622,9 +835,7 @@ class MapNavigator:
                         self._action.click(cx, cy)
                         last_click_time = now
                         clicked_transition = True
-                        if self.wait_for_state(ScreenState.ISLAND, timeout=3.0):
-                            return True
-                        if self.close_map():
+                        if self.wait_for_state(ScreenState.ISLAND, timeout=self._cfg.map.map_timeout):
                             return True
 
             time.sleep(step_sleep)

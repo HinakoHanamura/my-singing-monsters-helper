@@ -43,9 +43,7 @@ def test_clean_title_tokens_dynamic_normalization() -> None:
 
 def test_detect_state_1080p_and_widescreen_ocr_fallback() -> None:
     """Verify detect_state detects ScreenState.ISLAND on 1920x1080 widescreen even with theme/transparency variations."""
-    fpath = os.path.join(PROJECT_ROOT, "captures", "frame_20260829_124217_421.png")
-    if not os.path.isfile(fpath):
-        fpath = os.path.join(PROJECT_ROOT, "captures", "map", "map_20260902_185628_230.png")
+    fpath = os.path.join(PROJECT_ROOT, "captures", "map", "map_20260902_185628_230.png")
     if not os.path.isfile(fpath):
         pytest.skip("Island frame not found")
 
@@ -59,6 +57,22 @@ def test_detect_state_1080p_and_widescreen_ocr_fallback() -> None:
 
     state = nav.detect_state(frame_1080p)
     assert state == ScreenState.ISLAND
+
+
+def test_detect_state_community_contest_ad_is_modal() -> None:
+    """Verify island frame occluded by community contest ad is detected as ScreenState.MODAL."""
+    fpath = os.path.join(PROJECT_ROOT, "captures", "frame_20260829_124217_421.png")
+    if not os.path.isfile(fpath):
+        pytest.skip("Ad frame not found")
+
+    frame = cv2.imread(fpath)
+    frame_1080p = cv2.resize(frame, (1920, 1080))
+    window = MockWindow(frame=frame_1080p)
+    action = MockAction(window=window)
+    nav = MapNavigator(action_agent=action, window=window, config=DEFAULT_CONFIG)
+
+    state = nav.detect_state(frame_1080p)
+    assert state == ScreenState.MODAL
 
 
 def test_enter_selected_island_handles_extended_loading() -> None:

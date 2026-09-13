@@ -220,6 +220,59 @@ class ActionAgent:
         except Exception:
             return False
 
+    def send_key(self, vk_code: int) -> bool:
+        """Deliver a key press (KEYDOWN + KEYUP) to the background game window."""
+        if not self._window.ensure_attached():
+            return False
+        hwnd = self._window.hwnd
+        if hwnd is None:
+            return False
+        try:
+            with dpi_unaware_thread():
+                self._send(hwnd, win32con.WM_KEYDOWN, vk_code, 0)
+                time.sleep(0.04)
+                self._send(hwnd, win32con.WM_KEYUP, vk_code, 0)
+            return True
+        except Exception:
+            logger.exception("failed to deliver key %s", vk_code)
+            return False
+
+    def wheel(
+        self,
+        delta: int,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+        steps: int = 1,
+        step_delay: float = 0.02,
+    ) -> bool:
+        """Send mouse wheel scroll message(s). Negative delta scrolls down / zooms out."""
+        if not self._window.ensure_attached():
+            return False
+        hwnd = self._window.hwnd
+        if hwnd is None:
+            return False
+        try:
+            width, height = self._window.client_size()
+            cx = x if x is not None else (width // 2 if width > 0 else 500)
+            cy = y if y is not None else (height // 2 if height > 0 else 400)
+            with dpi_unaware_thread():
+                # Inject mouse move to activate cursor focus at the target zoom center
+                move_lparam = win32api.MAKELONG(cx, cy)
+                self._send(hwnd, win32con.WM_MOUSEMOVE, 0, move_lparam)
+                time.sleep(0.01)
+
+                sx, sy = win32gui.ClientToScreen(hwnd, (cx, cy))
+                wparam = (delta & 0xFFFF) << 16
+                lparam = win32api.MAKELONG(sx, sy)
+                for i in range(max(1, steps)):
+                    self._send(hwnd, win32con.WM_MOUSEWHEEL, wparam, lparam)
+                    if steps > 1 and i < steps - 1:
+                        time.sleep(step_delay)
+            return True
+        except Exception:
+            logger.exception("failed to deliver mouse wheel")
+            return False
+
     # ---------------------------------------------------------- humanisation
 
     def _humanize_point(self, x: int, y: int) -> Tuple[int, int]:

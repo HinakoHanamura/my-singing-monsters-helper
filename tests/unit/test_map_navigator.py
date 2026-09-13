@@ -37,9 +37,27 @@ class MockAction(ActionAgent):
         super().__init__(window=window)
         self.clicks: List[Tuple[int, int]] = []
         self.drags: List[Tuple[int, int, int, int]] = []
+        self.keys: List[int] = []
+        self.wheels: List[Tuple[int, Optional[int], Optional[int]]] = []
 
     def click(self, x: int, y: int) -> bool:
         self.clicks.append((x, y))
+        return True
+
+    def send_key(self, vk_code: int) -> bool:
+        self.keys.append(vk_code)
+        return True
+
+    def wheel(
+        self,
+        delta: int,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+        steps: int = 1,
+        step_delay: float = 0.02,
+    ) -> bool:
+        for _ in range(steps):
+            self.wheels.append((delta, x, y))
         return True
 
     def drag(
@@ -377,4 +395,166 @@ def test_map_navigator_letter_recognizer_property() -> None:
     assert nav.letter_recognizer is not None
     assert nav.letter_recognizer is nav._recognizer
     assert hasattr(nav.letter_recognizer, "is_blacklisted")
+
+
+def test_recover_blocked_island_ui_modal_red_x() -> None:
+    """When a modal with Red X is detected, recover_blocked_island_ui sends ESC."""
+    import win32con
+
+    fpath = os.path.join(PROJECT_ROOT, "captures", "piggy", "piggy_20260901_210003_967.png")
+    if not os.path.isfile(fpath):
+        pytest.skip("piggy capture frame not found")
+
+    frame = cv2.imread(fpath)
+    window = MockWindow(frame=frame)
+    action = MockAction(window=window)
+    nav = MapNavigator(action_agent=action, window=window, config=DEFAULT_CONFIG)
+
+    recovered = nav.recover_blocked_island_ui(frame)
+    assert recovered is True
+    assert win32con.VK_ESCAPE in action.keys
+
+
+def test_recover_blocked_island_ui_deselect() -> None:
+    """When no modal Red X is present, recover_blocked_island_ui zooms out and clicks safe ocean."""
+    # Plain frame with no red X
+    frame = np.zeros((768, 1024, 3), dtype=np.uint8)
+    window = MockWindow(frame=frame)
+    action = MockAction(window=window)
+    nav = MapNavigator(action_agent=action, window=window, config=DEFAULT_CONFIG)
+
+    recovered = nav.recover_blocked_island_ui(frame)
+    assert recovered is True
+    # Verify wheel zoom-out was sent (3 notches of -120 centered on screen)
+    assert len(action.wheels) == 3
+    assert action.wheels[0][0] == -120
+    assert action.wheels[0][1] == 1024 // 2
+    assert action.wheels[0][2] == 768 // 2
+    # Verify safe void click was sent to lower-left ocean
+    assert len(action.clicks) >= 1
+    click_x, click_y = action.clicks[0]
+    assert click_x == int(1024 * 0.11)
+    assert click_y == int(768 * 0.88)
+
+
+def test_dismiss_modal_full_frame_and_fallback() -> None:
+    """When a modal with Red X is present, dismiss_modal attempts ESC then falls back to click."""
+    fpath = os.path.join(PROJECT_ROOT, "captures", "piggy", "piggy_20260901_210003_967.png")
+    if not os.path.isfile(fpath):
+        pytest.skip("piggy capture frame not found")
+
+    frame = cv2.imread(fpath)
+    # Window continuously returns the piggy frame (simulating modal not closing with ESC)
+    window = MockWindow(frame=frame)
+    action = MockAction(window=window)
+    nav = MapNavigator(action_agent=action, window=window, config=DEFAULT_CONFIG)
+
+    dismissed = nav.dismiss_modal(frame)
+    assert dismissed is True
+    # Verify ESC was sent
+    import win32con
+    assert win32con.VK_ESCAPE in action.keys
+    # Since modal was still present on capture, direct click on red X coordinate was triggered
+    assert len(action.clicks) >= 1
+    # MatchResult center for piggy cancel is (678, 516)
+    assert action.clicks[0] == (678, 516)
+
+
+def test_open_map_self_healing_from_blocked_island() -> None:
+    """open_map automatically recovers when MAP button is initially blocked, then transitions."""
+    fpath_map = os.path.join(PROJECT_ROOT, "captures", "map", "map_20260902_185615_714.png")
+    fpath_island = os.path.join(PROJECT_ROOT, "captures", "map", "map_20260902_185628_230.png")
+    if not (os.path.isfile(fpath_map) and os.path.isfile(fpath_island)):
+        pytest.skip("captures not found")
+
+    frame_map = cv2.imread(fpath_map)
+    frame_island = cv2.imread(fpath_island)
+
+    # Frame sequence:
+    # 0: Blocked frame (blank/no MAP button) -> triggers recovery
+    # 1: Island frame with MAP button -> clicked
+    # 2: Map frame -> open_map succeeds
+    blocked_frame = np.zeros((768, 1024, 3), dtype=np.uint8)
+    frames = [blocked_frame, frame_island, frame_map]
+    frame_idx = 0
+
+    class SequenceWindow(MockWindow):
+        def capture(self) -> Optional[np.ndarray]:
+            nonlocal frame_idx
+            idx = min(frame_idx, len(frames) - 1)
+            frame_idx += 1
+            return frames[idx]
+
+    window = SequenceWindow()
+    action = MockAction(window=window)
+    nav = MapNavigator(action_agent=action, window=window, config=DEFAULT_CONFIG)
+
+    ok = nav.open_map(timeout=8.0)
+    assert ok is True
+    # At least one wheel zoom-out or recovery action occurred
+    assert len(action.wheels) >= 1
+    # At least one click on safe void and one click on MAP button
+    assert len(action.clicks) >= 2
+
+
+def test_detect_state_mailbox_is_modal_and_dismisses() -> None:
+    """Mailbox screen with close button must NOT be detected as MAP, and should be dismissed."""
+    fpath_mail = os.path.join(PROJECT_ROOT, "close", "close_20260913_200140_173.png")
+    if not os.path.isfile(fpath_mail):
+        pytest.skip("close/close_20260913_200140_173.png not found")
+
+    frame_mail = cv2.imread(fpath_mail)
+    win = MockWindow(frame=frame_mail)
+    act = MockAction(win)
+    nav = MapNavigator(action_agent=act, window=win, config=DEFAULT_CONFIG)
+
+    st = nav.detect_state(frame_mail)
+    assert st == ScreenState.MODAL
+    assert st != ScreenState.MAP
+
+    # Must be able to find and dismiss the close button
+    match_mail = nav.find_modal_cancel(frame_mail)
+    assert match_mail is not None
+    dismissed = nav.dismiss_modal(frame_mail)
+    assert dismissed is True
+
+
+def test_dismiss_modal_round_vine_popup() -> None:
+    """Announcements/news with round vine red X must be found and dismissed."""
+    fpath_news = os.path.join(PROJECT_ROOT, "close", "close_20260913_200154_188.png")
+    if not os.path.isfile(fpath_news):
+        pytest.skip("close/close_20260913_200154_188.png not found")
+
+    frame_news = cv2.imread(fpath_news)
+    win = MockWindow(frame=frame_news)
+    act = MockAction(win)
+    nav = MapNavigator(action_agent=act, window=win, config=DEFAULT_CONFIG)
+
+    match_news = nav.find_modal_cancel(frame_news)
+    assert match_news is not None
+    assert match_news.score >= 0.85
+    dismissed = nav.dismiss_modal(frame_news)
+    assert dismissed is True
+
+
+def test_detect_state_ad_banner_is_modal() -> None:
+    """Promotional ad with round red X must be recognized as ScreenState.MODAL."""
+    fpath_ad = os.path.join(PROJECT_ROOT, "close", "close_20260913_200200_186.png")
+    if not os.path.isfile(fpath_ad):
+        pytest.skip("close/close_20260913_200200_186.png not found")
+
+    frame_ad = cv2.imread(fpath_ad)
+    win = MockWindow(frame=frame_ad)
+    act = MockAction(win)
+    nav = MapNavigator(action_agent=act, window=win, config=DEFAULT_CONFIG)
+
+    st = nav.detect_state(frame_ad)
+    assert st == ScreenState.MODAL
+
+    match_ad = nav.find_modal_cancel(frame_ad)
+    assert match_ad is not None
+    assert match_ad.score >= 0.85
+
+
+
 
